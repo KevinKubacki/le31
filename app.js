@@ -221,7 +221,30 @@ const otherNames = () => DB.profils.filter(p => p.id !== ME).map(p => p.nom).joi
 const otherAcc = id => (accs().find(a => a.id !== id) || {}).id;
 const profiles = () => DB.profils.slice().sort((a, b) => (num(a.ordre) || 0) - (num(b.ordre) || 0));
 const pname = id => (DB.profils.find(p => p.id === id) || {}).nom || '';
-const catsOf = acc => DB.categories.filter(c => c.compte === acc).sort((a, b) => (num(a.ordre) || 0) - (num(b.ordre) || 0));
+// Sous-catégories : le nom complet est « Parent › Sous-catégorie » (ex. « Véhicule › Carburant »)
+const SEP = ' › ';
+const topOf = n => String(n || '').split(SEP)[0];
+const leafOf = n => { n = String(n || ''); const i = n.lastIndexOf(SEP); return i < 0 ? n : n.slice(i + SEP.length); };
+const inCat = (c, P) => (c || '') === P || String(c || '').startsWith(P + SEP);
+const normCat = s => String(s || '').replace(/\s*(›|>|\/)\s*/g, SEP).replace(/\s+/g, ' ').trim();
+const catHtml = n => n && n.includes(SEP) ? `<span class="cpar">${esc(topOf(n))} › </span>${esc(leafOf(n))}` : esc(n);
+const catsOf = acc => {
+  const l = DB.categories.filter(c => c.compte === acc), o = n => { const t = l.find(x => x.nom === topOf(n)); return num((t || {}).ordre) || 0; };
+  return l.sort((a, b) => o(a.nom) - o(b.nom) || topOf(a.nom).localeCompare(topOf(b.nom)) || (a.nom.includes(SEP) ? 1 : 0) - (b.nom.includes(SEP) ? 1 : 0) || (num(a.ordre) || 0) - (num(b.ordre) || 0));
+};
+// une catégorie proposée (« Carburant ») déplacée sous un parent (« Véhicule › Carburant ») garde sa place
+function resolveCat(acc, c) {
+  if (!c || catsOf(acc).some(x => x.nom === c)) return c;
+  const m = catsOf(acc).find(x => x.nom.includes(SEP) && leafOf(x.nom).toLowerCase() === c.toLowerCase());
+  return m ? m.nom : c;
+}
+// opérations pour créer une catégorie (et son parent s'il n'existe pas)
+function newCatOps(acc, nom, have) {
+  have = have || new Set(catsOf(acc).map(c => c.nom.toLowerCase()));
+  const ops = []; let ordre = Math.max(0, ...DB.categories.map(c => num(c.ordre) || 0));
+  [nom.includes(SEP) ? topOf(nom) : null, nom].filter(Boolean).forEach(n => { if (!have.has(n.toLowerCase())) { have.add(n.toLowerCase()); ops.push(upd('Categories', { id: uid(), compte: acc, nom: n, budget: '', ordre: ++ordre })); } });
+  return ops;
+}
 const param = (k, d) => { const p = DB.parametres.find(x => x.cle === k); return p ? p.valeur : d; };
 const started = acc => num(accOf(acc).soldeDepart) !== null;
 const startMonth = acc => accOf(acc).moisDepart || CUR;
@@ -548,7 +571,8 @@ function vHome() {
   const fx = r.ev.filter(e => e.kind === 'fixe' || e.kind === 'vir'), fxOut = -fx.filter(e => e.v < 0).reduce((a, e) => a + e.v, 0);
   const fxDone = fx.filter(e => e.d <= r.T).length;
   const pSpent = r.cats.reduce((a, c) => a + c.spent, 0), pHab = r.cats.reduce((a, c) => a + c.target, 0);
-  const cats = r.cats.filter(c => c.spent > 0.5 || c.target > 0.5).sort((a, b) => Math.max(b.spent, b.target) - Math.max(a.spent, a.target)).slice(0, 6);
+  const grp = {}; r.cats.forEach(c => { const t = topOf(c.nom), g = grp[t] = grp[t] || { nom: t, spent: 0, target: 0, budget: 0, n: 0 }; g.spent += c.spent; g.target += c.target; g.budget += num(c.budget) || 0; g.n += c.nom.includes(SEP) ? 1 : 0; });
+  const cats = Object.values(grp).filter(c => c.spent > 0.5 || c.target > 0.5).sort((a, b) => Math.max(b.spent, b.target) - Math.max(a.spent, a.target)).slice(0, 6);
   const unc = firstUnclosed(acc), frac = r.T / r.D, dv = Math.min(r.D, Math.max(1, UI.dayV || TODAY));
   return `<section class="view">
   ${banners(acc)}
@@ -579,7 +603,7 @@ function vHome() {
   </div>` : ''}
   ${cats.length ? `<div class="block"><div class="rowhead"><h2>Ponctuel : où part l'argent</h2><button class="btn ghost small" data-go="ponct">Détail</button></div>
     <div class="list">${cats.map(c => { const p = c.target ? c.spent / c.target : (c.spent ? 2 : 0), cl = p > 1 ? 'over' : p > frac + .15 ? 'near' : '';
-      return `<button class="catbar" data-pcat="${esc(c.nom)}"><div class="t"><b>${esc(catLabel(c.nom))}</b><span>${eur0(c.spent)} / ${eur0(c.target)}${c.budget ? ' budget' : ''}</span></div><div class="bar"><i class="${cl}" style="width:${Math.min(100, p * 100)}%"></i><em style="left:${frac * 100}%"></em></div></button>`; }).join('')}</div>
+      return `<button class="catbar" data-pcat="${esc(c.nom)}"><div class="t"><b>${esc(catLabel(c.nom))}${c.n ? '<small class="mini"> · détail</small>' : ''}</b><span>${eur0(c.spent)} / ${eur0(c.target)}${c.budget ? ' budget' : ''}</span></div><div class="bar"><i class="${cl}" style="width:${Math.min(100, p * 100)}%"></i><em style="left:${frac * 100}%"></em></div></button>`; }).join('')}</div>
     <div class="hint">Dépensé ce mois-ci / habitude (ou budget s'il y en a un). Le trait : où vous devriez en être au ${TODAY}. Hors fixes et hors mouvements exceptionnels.</div></div>` : ''}
   <div class="block"><div class="rowhead"><h2>À venir d'ici le ${r.D}</h2><span class="sub">${upcoming.length} opération${upcoming.length > 1 ? 's' : ''}</span></div>
     <div class="list">${upcoming.length ? upcoming.map(rowEv).join('') : `<div class="empty">Plus rien de prévu ce mois-ci.</div>`}
@@ -610,7 +634,7 @@ function vPonct() {
   if (!P.k || P.k < k0) P.k = CUR;
   const q = NORM(P.q.trim()), all = DB.operations.filter(o => o.compte === acc);
   const base = q ? all.filter(o => NORM(nameOf(o) + ' ' + o.libelle + ' ' + (o.categorie || '')).includes(q)) : all.filter(o => String(o.date).slice(0, 7) === P.k);
-  const F = { tout: o => true, nc: o => isPonct(o) && !o.categorie, exc: o => o.type === 'exc' || o.type === 'int', in: o => (num(o.montant) || 0) > 0 && isPonct(o), cat: o => (o.categorie || '') === P.cat && isPonct(o) };
+  const F = { tout: o => true, nc: o => isPonct(o) && !o.categorie, exc: o => o.type === 'exc' || o.type === 'int', in: o => (num(o.montant) || 0) > 0 && isPonct(o), cat: o => (P.cat ? inCat(o.categorie, P.cat) : !o.categorie) && isPonct(o) };
   const list = base.filter(F[P.f] || F.tout).sort((a, b) => String(b.date).localeCompare(String(a.date)) || String(b.id).localeCompare(String(a.id)));
   const ncAll = all.filter(F.nc).length;
   const r = calc(acc, P.k, startOf(acc, P.k)), spent = r.cats.reduce((a, c) => a + c.spent, 0), hab = catList(acc).reduce((a, c) => a + habit(acc, c.nom), 0);
@@ -619,7 +643,7 @@ function vPonct() {
   const groups = {}; list.slice(0, 300).forEach(o => { const g = q ? String(o.date).slice(0, 7) : String(o.date); (groups[g] = groups[g] || []).push(o); });
   const head = g => q ? mLabel(g) : (+g.slice(8, 10)) + ' ' + MONTHS_L[pm(g.slice(0, 7)).m];
   const row = o => { const v = num(o.montant) || 0, tg = o.type === 'exc' ? '<span class="tag w">exceptionnel</span>' : o.type === 'int' ? '<span class="tag g">entre mes comptes</span>' : o.type === 'vir' ? '<span class="tag">lié</span>' : '';
-    return `<button class="item" data-oid="${esc(o.id)}" style="grid-template-columns:1fr auto"><span class="lbl"><b>${esc(nameOf(o))}${tg}</b><small>${o.type === 'ajust' ? 'Correction de solde' : o.categorie ? esc(o.categorie) : '<span style="color:var(--warn);font-weight:700">À classer</span>'}${q ? ' · ' + (+String(o.date).slice(8, 10)) + ' ' + MONTHS[pm(String(o.date).slice(0, 7)).m] + ' ' + String(o.date).slice(2, 4) : ''}${o.profil && DB.profils.length > 1 && o.profil !== ME ? ' · ' + esc(pname(o.profil)) : ''}</small></span><span class="amt ${v > 0 ? 'pos' : 'neg'}">${sgn(v)}</span></button>`; };
+    return `<button class="item" data-oid="${esc(o.id)}" style="grid-template-columns:1fr auto"><span class="lbl"><b>${esc(nameOf(o))}${tg}</b><small>${o.type === 'ajust' ? 'Correction de solde' : o.categorie ? catHtml(o.categorie) : '<span style="color:var(--warn);font-weight:700">À classer</span>'}${q ? ' · ' + (+String(o.date).slice(8, 10)) + ' ' + MONTHS[pm(String(o.date).slice(0, 7)).m] + ' ' + String(o.date).slice(2, 4) : ''}${o.profil && DB.profils.length > 1 && o.profil !== ME ? ' · ' + esc(pname(o.profil)) : ''}</small></span><span class="amt ${v > 0 ? 'pos' : 'neg'}">${sgn(v)}</span></button>`; };
   return `<section class="view">
     ${q ? `<div class="rowhead"><h2>${list.length} résultat${list.length > 1 ? 's' : ''}</h2><span class="sub">tous les mois</span></div>` : `<div class="mnav"><button data-pm="-1" aria-label="Mois précédent" ${P.k <= k0 ? 'disabled' : ''}>‹</button><b>${mLabel(P.k)}</b><button data-pm="1" aria-label="Mois suivant" ${P.k >= lastOp ? 'disabled' : ''}>›</button></div>
     <div class="hero" style="gap:8px"><div class="rowhead"><span class="sub">Dépenses ponctuelles${P.k === CUR ? ' à ce jour' : ''}</span>${P.k <= CUR ? pill : ''}</div>
@@ -638,7 +662,14 @@ function vPonct() {
 /* ----- Onglet Bilan : évolution mois par mois des thèmes choisis ----- */
 const BIL = { n: store.get('le31-bil-n', 12), mode: store.get('le31-bil-mode', 'barres'), exc: false, sel: null, table: false };
 const BTHEMES = { __ponct: 'Tout le ponctuel', __fixes: 'Toutes les charges fixes' };
-const bLabel = c => BTHEMES[c] || catLabel(c);
+const bLabel = c => BTHEMES[c] || catLabel(leafOf(c));
+// remplacer une catégorie principale par toutes ses sous-catégories
+function bilDetail(acc, P) {
+  const S = bilSel(acc), kids = catsOf(acc).map(c => c.nom).filter(n => n.startsWith(P + SEP));
+  S.cats = S.cats.filter(c => c !== P); delete S.col[P];
+  kids.forEach(k => { if (S.cats.length < 8 && !S.cats.includes(k)) { const u = new Set(Object.values(S.col)); let s = 1; while (u.has(s)) s++; S.cats.push(k); S.col[k] = s; } });
+  store.set('le31-bil|' + acc, S); render();
+}
 function bilSel(acc) {
   const s = store.get('le31-bil|' + acc, null);
   if (s && s.cats) return s;
@@ -655,8 +686,9 @@ function bilVal(acc, k, c) {
   if (c === '__ponct') return Math.max(0, -opsOf(acc, k).filter(o => okOp(o) && !isIncomeCat(o.categorie) && (o.categorie || (num(o.montant) || 0) < 0)).reduce((a, o) => a + (num(o.montant) || 0), 0));
   const fx = e => (e.kind === 'fixe' || e.kind === 'vir') && (e.ok || e.d <= T);
   if (c === '__fixes') return -ev.filter(e => fx(e) && e.v < 0).reduce((a, e) => a + e.v, 0);
-  const ops = opsOf(acc, k).filter(o => okOp(o) && (o.categorie || '') === c).reduce((a, o) => a + (num(o.montant) || 0), 0);
-  const fix = ev.filter(e => fx(e) && e.kind === 'fixe' && (e.cat || '') === c).reduce((a, e) => a + e.v, 0);
+  const mine = x => c ? inCat(x, c) : !x; // une catégorie principale comprend ses sous-catégories
+  const ops = opsOf(acc, k).filter(o => okOp(o) && mine(o.categorie)).reduce((a, o) => a + (num(o.montant) || 0), 0);
+  const fix = ev.filter(e => fx(e) && e.kind === 'fixe' && mine(e.cat === 'Autre' ? '' : e.cat)).reduce((a, e) => a + e.v, 0);
   const net = ops + fix;
   return isIncomeCat(c) ? Math.max(0, net) : Math.max(0, -net);
 }
@@ -667,19 +699,22 @@ function vBilan() {
   const months = Array.from({ length: n }, (_, i) => addM(CUR, i - n + 1));
   const used = new Set(DB.operations.filter(o => o.compte === acc && (isPonct(o) || o.type === 'exc')).map(o => o.categorie || ''));
   DB.fixes.filter(f => f.compte === acc).forEach(f => used.add(f.categorie || ''));
+  [...used].forEach(c => { if (c.includes(SEP)) used.add(topOf(c)); });
   const cats = catsOf(acc).map(c => c.nom).filter(c => used.has(c)).concat([...used].filter(c => c && !catsOf(acc).some(x => x.nom === c) && !['Virement', 'Correction de solde'].includes(c))).concat(used.has('') ? [''] : []);
   const themes = ['__ponct', '__fixes'].concat(cats), sel = S.cats.filter(c => themes.includes(c));
   const data = sel.map(c => ({ c, v: months.map(k => bilVal(acc, k, c)) }));
   // « Tout le ponctuel » contient déjà les catégories : on ne les additionne pas (barres côte à côte, pas de total)
   const fixCats = new Set(DB.fixes.filter(f => f.compte === acc).map(f => f.categorie || ''));
-  const overlap = (sel.includes('__ponct') && sel.some(c => !BTHEMES[c])) || (sel.includes('__fixes') && sel.some(c => !BTHEMES[c] && fixCats.has(c)));
+  const overlap = (sel.includes('__ponct') && sel.some(c => !BTHEMES[c])) || (sel.includes('__fixes') && sel.some(c => !BTHEMES[c] && [...fixCats].some(f => inCat(f, c))))
+    || sel.some(c => !BTHEMES[c] && sel.some(d => d !== c && !BTHEMES[d] && inCat(d, c)));
   BIL.overlap = overlap;
   data.forEach(d => { const f = months.map((k, i) => i).filter(i => months[i] < CUR); d.avg = f.length ? f.reduce((x, i) => x + d.v[i], 0) / f.length : 0; });
   const tot = months.map((k, i) => data.reduce((a, d) => a + d.v[i], 0));
   const full = months.map((k, i) => i).filter(i => months[i] < CUR), avg = full.length ? full.reduce((a, i) => a + tot[i], 0) / full.length : 0;
   const l3 = full.slice(-3), p3 = full.slice(-6, -3), m3 = l3.length ? l3.reduce((a, i) => a + tot[i], 0) / l3.length : 0, mp = p3.length ? p3.reduce((a, i) => a + tot[i], 0) / p3.length : 0;
   const trend = p3.length && mp > 0 ? (m3 - mp) / mp : null;
-  const chip = c => { const on = sel.includes(c); return `<button class="chip bchip" data-bcat="${esc(c)}" aria-pressed="${on}">${on ? `<i style="background:var(--s${S.col[c] || 1})"></i>` : ''}${esc(bLabel(c))}</button>`; };
+  const hasKids = c => !BTHEMES[c] && cats.some(x => x.startsWith(c + SEP));
+  const chip = c => { const on = sel.includes(c), kid = c.includes(SEP); return `<button class="chip bchip ${kid ? 'kid' : ''}" data-bcat="${esc(c)}" aria-pressed="${on}">${on ? `<i style="background:var(--s${S.col[c] || 1})"></i>` : ''}${kid ? '↳ ' + esc(leafOf(c)) : esc(bLabel(c)) + (hasKids(c) ? ' (tout)' : '')}</button>${hasKids(c) && on ? `<button class="chip bdet" data-bdet="${esc(c)}">Détailler ${esc(c)}</button>` : ''}`; };
   const selM = BIL.sel && months.includes(BIL.sel) ? BIL.sel : null;
   return `<section class="view">
     <div class="rowhead"><h2>Bilan</h2><span class="sub">${esc(accName(acc))}</span></div>
@@ -790,7 +825,7 @@ function vAdd() {
     <div class="seg" role="group" aria-label="Type" style="grid-template-columns:1fr 1fr 1fr"><button type="button" data-sens="-" aria-pressed="${draft.sens === '-'}">Dépense</button><button type="button" data-sens="+" aria-pressed="${draft.sens === '+'}">Rentrée</button>${others.length ? `<button type="button" data-sens="v" aria-pressed="${isVir}">Virement</button>` : ''}</div>
     <div class="amountbox"><input id="amt" inputmode="decimal" placeholder="0,00" aria-label="Montant" autocomplete="off"><span>€</span></div>
     ${isVir ? (others.length > 1 ? `<div class="field"><label for="vto">Vers</label><select id="vto" data-vto="1">${others.map(a => `<option value="${esc(a.id)}" ${a.id === draft.to ? 'selected' : ''}>${esc(a.nom)}</option>`).join('')}</select></div>` : '') + `<div class="note">De <b>${esc(accName(acc))}</b> vers <b>${esc(accName(draft.to))}</b> : l'opération apparaît sur les deux comptes.</div>` :
-    `<div class="field"><label>Type de dépense</label><div class="chips">${cats.map(c => `<button type="button" class="chip" data-cat="${esc(c)}" aria-pressed="${c === draft.cat}">${esc(c)}</button>`).join('')}<button type="button" class="chip" data-newcat="${esc(acc)}" style="border-style:dashed;color:var(--accent)">＋ Nouvelle</button></div></div>`}
+    `<div class="field"><label>Type de dépense</label><div class="chips">${cats.map(c => `<button type="button" class="chip" data-cat="${esc(c)}" aria-pressed="${c === draft.cat}">${catHtml(c)}</button>`).join('')}<button type="button" class="chip" data-newcat="${esc(acc)}" style="border-style:dashed;color:var(--accent)">＋ Nouvelle</button></div></div>`}
     <div class="two"><div class="field"><label for="dt">Date</label><input id="dt" type="date" value="${TODAY_ISO}"></div>
     <div class="field"><label for="lb">Libellé</label><input id="lb" placeholder="${isVir ? 'Ex. Complément courses' : 'Ex. Drive'}" autocomplete="off"></div></div>
     ${isVir ? '' : `<label class="switch" for="addExc"><span style="font-size:14px">Exceptionnel (hors habitudes)</span><input type="checkbox" id="addExc"></label>`}
@@ -920,7 +955,7 @@ function vSet() {
     <div class="field"><label for="se-${esc(k)}">Seuil de sécurité (€)</label><input id="se-${esc(k)}" data-seuil="${esc(k)}" inputmode="decimal" value="${fr(A.seuil)}"></div></div>
     <div class="field"><label for="md-${esc(k)}">Mois de départ</label><input id="md-${esc(k)}" type="month" data-mdep="${esc(k)}" value="${esc(startMonth(k))}" max="${CUR}"></div>
     <div class="hint">Le solde de départ est le solde au 1er du mois de départ. Pour recaler en cours de mois, utilise plutôt « Corriger le solde » dans l'onglet Mois.</div>
-    <div class="field"><label>Catégories de dépenses</label><div class="list">${cats.length ? cats.map(c => `<button class="item" data-editcat="${esc(c.id)}"><span class="day">${num(c.budget) ? '◔' : '·'}</span><span class="lbl"><b>${esc(c.nom)}</b><small>${num(c.budget) ? 'enveloppe mensuelle' : 'sans enveloppe'}</small></span><span class="amt">${num(c.budget) ? eur0(num(c.budget)) : ''}</span></button>`).join('') : '<div class="empty">Aucune catégorie.</div>'}</div></div>
+    <div class="field"><label>Catégories de dépenses</label><div class="list">${cats.length ? cats.map(c => `<button class="item ${c.nom.includes(SEP) ? 'child' : ''}" data-editcat="${esc(c.id)}"><span class="day">${c.nom.includes(SEP) ? '↳' : num(c.budget) ? '◔' : '·'}</span><span class="lbl"><b>${esc(leafOf(c.nom))}</b><small>${num(c.budget) ? 'enveloppe mensuelle' : 'sans enveloppe'}</small></span><span class="amt">${num(c.budget) ? eur0(num(c.budget)) : ''}</span></button>`).join('') : '<div class="empty">Aucune catégorie.</div>'}</div></div>
     <button class="btn ghost small" data-newcat="${esc(k)}">＋ Ajouter une catégorie</button></div>`; };
   const syncTxt = { ok: 'Synchronisé', wait: 'Envoi en cours…', off: 'Hors ligne', err: 'Accès coupé' }[SYNC.state] || '';
   return `<section class="view">
@@ -1081,7 +1116,8 @@ function ruleOf(acc, lib, montant) {
   const k = keyOf(lib), m = motifOf(lib), s = montant > 0 ? '+' + k : null;
   return (s && DB.regles.find(x => x.compte === acc && x.motif === s)) || DB.regles.find(x => x.compte === acc && x.motif === k) || DB.regles.find(x => !x.compte && (x.motif === k || x.motif === m));
 }
-function guessCat(lib, montant, acc) {
+function guessCat(lib, montant, acc) { return resolveCat(acc || UI.acc, guessCat0(lib, montant, acc)); }
+function guessCat0(lib, montant, acc) {
   const r = ruleOf(acc || UI.acc, lib, montant); if (r && r.categorie) return r.categorie;
   const N = NORM(lib), d = dico(N);
   if (d) return montant > 0 && d[3] !== undefined ? d[3] : d[2]; // un remboursement reste dans la catégorie du marchand
@@ -1364,7 +1400,7 @@ function vImport() {
     <div class="list">${shown.map(g => `<div class="rec"><div class="rl">
         <input class="nm" data-gname="${esc(g.key)}" value="${esc(g.nom)}" aria-label="Nom">
         <div class="raw">${esc(g.lib.slice(0, 60))} · ${g.txs.length} opération${g.txs.length > 1 ? 's' : ''}</div>
-        ${I.creating === g.key ? `<div class="inline"><input id="newCatIn" placeholder="Nouvelle catégorie" autocomplete="off" style="flex:1;min-width:0"><button class="btn small" data-gnewok="${esc(g.key)}">Créer</button></div>`
+        ${I.creating === g.key ? `<div class="inline"><input id="newCatIn" placeholder="Ex. Véhicule > Garage" autocomplete="off" style="flex:1;min-width:0"><button class="btn small" data-gnewok="${esc(g.key)}">Créer</button></div>`
         : `<select data-gcat="${esc(g.key)}" aria-label="Catégorie" class="${g.cat ? '' : 'todo'}"><option value="" ${g.cat ? '' : 'selected'}>À classer…</option>${cats.map(c => `<option ${c === g.cat ? 'selected' : ''}>${esc(c)}</option>`).join('')}<option value="__new">＋ Nouvelle catégorie…</option></select>`}
       </div><div class="rr"><span class="amt ${g.tot > 0 ? 'pos' : 'neg'}">${sgn(r2(g.tot))}</span>${g.txs.length > 1 ? '<small class="mini">au total</small>' : ''}</div></div>`).join('') || '<div class="empty">Aucun résultat.</div>'}
       ${list.length > shown.length ? `<button class="item" data-gmore="1" style="grid-template-columns:1fr;text-align:center;color:var(--accent);font-weight:700">Afficher ${Math.min(30, list.length - shown.length)} de plus (${list.length - shown.length} restants)</button>` : ''}</div>
@@ -1415,7 +1451,7 @@ function commitImport() {
   I.kept.filter(t => t.same).forEach(t => ops.push(upd('Operations', { id: t.same, ref: t.ref })));
   const have = new Set(catsOf(acc).map(c => c.nom.toLowerCase()));
   let ordre = Math.max(0, ...DB.categories.map(c => num(c.ordre) || 0));
-  const needCat = cat => { if (cat && !have.has(cat.toLowerCase())) { have.add(cat.toLowerCase()); ops.push(upd('Categories', { id: uid(), compte: acc, nom: cat, budget: '', ordre: ++ordre })); } };
+  const needCat = cat => { if (cat) ops.push(...newCatOps(acc, cat, have)); };
   if (I.first) I.recur.filter(r => I.keep[r.id]).forEach(r => {
     const id = uid(), inK = r.txs.filter(t => t.date.slice(0, 7) >= I.mois);
     if (r.vir && I.virOn[r.id]) {
@@ -1520,7 +1556,7 @@ function fixedSheet(f, kind, fromOp) {
   if (kind === 'vir') f = f || { id: '', libelle: 'Apport au ' + accName(oth), montant: '', jour: '1', de: acc, vers: oth, profil: (profiles()[0] || {}).id, debut: CUR, fin: '', actif: 'oui' };
   else f = f || { id: '', libelle: '', montant: '', sens: sheetRoot.dataset.sens || '-', jour: '1', frequence: 'M', moisRef: String(pm(CUR).m + 1), categorie: '', debut: CUR, fin: '', actif: 'oui' };
   const p = !isNew && point(CUR, (kind === 'vir' ? 'v' : 'f') + f.id);
-  const catList = [...new Set(DB.fixes.map(x => x.categorie).filter(Boolean).concat(['Logement', 'Crédits', 'Énergie', 'Assurances', 'Abonnements', 'Impôts', 'Enfants', 'Épargne', 'Revenus']))];
+  const catList = [...new Set(catsOf(acc).map(c => c.nom).concat(DB.fixes.map(x => x.categorie)).filter(Boolean).concat(['Logement', 'Crédits', 'Énergie', 'Assurances', 'Abonnements', 'Impôts', 'Enfants', 'Épargne', 'Revenus']))];
   const nSim = fromOp ? 1 + simOps(fromOp).length : 0;
   openSheet(`<form class="form" id="fixForm" data-id="${esc(f.id)}" data-kind="${kind}" data-fromop="${fromOp ? esc(fromOp.id) : ''}" novalidate>
     <h2>${fromOp ? 'Passer en charge fixe' : isNew ? 'Nouvelle opération fixe' : 'Modifier'}</h2>
@@ -1549,7 +1585,11 @@ function catSheet(acc, c) {
   openSheet(`<form class="form" id="catForm" data-acc="${esc(acc)}" data-id="${c ? esc(c.id) : ''}" novalidate>
     <h2>${c ? 'Modifier la catégorie' : 'Nouvelle catégorie'}</h2>
     <div class="mini" style="font-size:13px">${esc(accName(acc))}</div>
-    <div class="field"><label for="cN">Nom</label><input id="cN" value="${c ? esc(c.nom) : ''}" placeholder="Ex. Animaux" autocomplete="off"></div>
+    <div class="field"><label for="cN">Nom</label><input id="cN" value="${c ? esc(leafOf(c.nom)) : ''}" placeholder="Ex. Garage" autocomplete="off"></div>
+    ${(() => { const kids = c && catsOf(acc).some(x => x.nom.startsWith(c.nom + SEP)), tops = catsOf(acc).filter(x => !x.nom.includes(SEP) && (!c || x.id !== c.id) && !isIncomeCat(x.nom));
+      return kids ? `<div class="hint">Catégorie principale : ses sous-catégories sont ${catsOf(acc).filter(x => x.nom.startsWith(c.nom + SEP)).map(x => esc(leafOf(x.nom))).join(', ')}.</div>`
+        : `<div class="field"><label for="cP">Ranger dans</label><select id="cP"><option value="">— Catégorie principale —</option>${tops.map(x => `<option ${c && topOf(c.nom) === x.nom && c.nom.includes(SEP) ? 'selected' : ''}>${esc(x.nom)}</option>`).join('')}</select>
+        <div class="hint">Ex. ranger Carburant, Garage et Péage dans Véhicule : le Bilan et l'onglet Mois pourront montrer Véhicule en entier ou dans le détail.</div></div>`; })()}
     <div class="field"><label for="cB">Enveloppe mensuelle (€, optionnel)</label><input id="cB" inputmode="decimal" value="${c ? fr(c.budget) : ''}" placeholder="Vide = pas d'enveloppe"></div>
     ${isShared(acc) ? `<div class="note">Compte partagé : la catégorie est la même pour ${esc(otherNames())}.</div>` : ''}
     <div class="actions">${c ? `<button type="button" class="btn danger" data-catdel="${esc(c.id)}">Supprimer</button>` : ''}<button class="btn" type="submit">Enregistrer</button></div>
@@ -1568,7 +1608,7 @@ function opSheet(o) {
     ${isAdj ? `<div class="note">${amt >= 0 ? 'Ajout' : 'Retrait'} de ${eur(Math.abs(amt))} pour recaler le solde sur la banque.</div>` : ''}
     <div class="field"><label for="oL">${imp ? 'Nom' + (sim.length ? ` (pour les ${sim.length + 1} opérations de ce marchand)` : '') : 'Libellé'}</label><input id="oL" value="${esc(nameOf(o))}" autocomplete="off"></div>
     ${!isVir && !isAdj ? `<div class="field"><label for="oC">Catégorie</label><select id="oC" data-ocat="1"><option value="" ${o.categorie ? '' : 'selected'}>À classer</option>${cats.map(c => `<option ${c === o.categorie ? 'selected' : ''}>${esc(c)}</option>`).join('')}<option value="__new">＋ Nouvelle catégorie…</option></select>
-      <input id="oCnew" placeholder="Nom de la nouvelle catégorie" autocomplete="off" hidden style="margin-top:6px"></div>
+      <input id="oCnew" placeholder="Ex. Véhicule > Garage (sous-catégorie) ou Animaux" autocomplete="off" hidden style="margin-top:6px"></div>
       ${sim.length ? `<label class="switch" for="oSim" style="gap:10px"><span style="font-size:14px">Appliquer la catégorie aux <b>${sim.length}</b> autre${sim.length > 1 ? 's' : ''} opération${sim.length > 1 ? 's' : ''} de ce marchand, et aux prochains imports</span><input type="checkbox" id="oSim" checked></label>` : ''}
       <div class="field"><label>Compter comme</label><div class="seg" style="grid-template-columns:1fr 1fr 1fr" role="group" aria-label="Type">${[['ponct', 'Normal'], ['exc', 'Exceptionnel'], ['int', 'Entre mes comptes']].map(([k, l]) => `<button type="button" data-okind="${k}" aria-pressed="${kind === k}">${l}</button>`).join('')}</div>
       <div class="hint" id="kindHint">${kind === 'exc' ? 'Compté dans le solde, pas dans les habitudes ni les prévisions.' : kind === 'int' ? 'Épargne, livret, autre compte à toi : ni dépense ni revenu.' : 'Dépense ou rentrée courante : entre dans les habitudes.'}</div></div>` : ''}
@@ -1667,7 +1707,7 @@ document.addEventListener('click', ev => {
   }
   if (ds.rkeep) { IMP.keep[ds.rkeep] = ds.v === '1'; render(); return; }
   if (ds.bigk) { IMP.kind[ds.bigk] = ds.k; t.parentNode.querySelectorAll('[data-bigk]').forEach(b => b.setAttribute('aria-pressed', b === t)); return; }
-  if (ds.gnewok) { const n = ($('newCatIn').value || '').trim(); if (!n) { toast('Donne un nom'); return; } if (!IMP.newCats.includes(n)) IMP.newCats.push(n); IMP.gcat[ds.gnewok] = n; IMP.gtouch[ds.gnewok] = 1; IMP.creating = null; render(); toast(`Catégorie « ${n} » créée`); return; }
+  if (ds.gnewok) { const n = normCat($('newCatIn').value); if (!n) { toast('Donne un nom'); return; } if (!IMP.newCats.includes(n)) IMP.newCats.push(n); IMP.gcat[ds.gnewok] = n; IMP.gtouch[ds.gnewok] = 1; IMP.creating = null; render(); toast(`Catégorie « ${n} » créée`); return; }
   if (ds.gmore) { IMP.gshow += 30; render(); return; }
   if (ds.noreimp) { store.set('le31-noreimp|' + ds.noreimp, true); render(); return; }
   if (ds.dupfix) {
@@ -1677,6 +1717,7 @@ document.addEventListener('click', ev => {
     commit(ops); toast('Doublon supprimé : compté une seule fois'); return;
   }
   if ('bcat' in ds) { bilToggle(UI.acc, ds.bcat); return; }
+  if (ds.bdet) { bilDetail(UI.acc, ds.bdet); return; }
   if (ds.bn) { BIL.n = +ds.bn; store.set('le31-bil-n', BIL.n); render(); return; }
   if (ds.bmode) { BIL.mode = ds.bmode; store.set('le31-bil-mode', BIL.mode); render(); return; }
   if (ds.tofix) { const o = DB.operations.find(x => x.id === ds.tofix); if (o) { closeSheet(); fixFromOp(o); } return; }
@@ -1815,8 +1856,10 @@ document.addEventListener('submit', ev => {
     closeSheet(); return;
   }
   if (f.id === 'catForm') {
-    const acc = f.dataset.acc, id = f.dataset.id, nom = $('cN').value.trim(), b = num($('cB').value);
-    if (!nom) { toast('Donne un nom'); return; }
+    const acc = f.dataset.acc, id = f.dataset.id, leaf = $('cN').value.trim(), b = num($('cB').value), par = $('cP') ? $('cP').value : '';
+    if (!leaf) { toast('Donne un nom'); return; }
+    if (/›|>|\//.test(leaf)) { toast('Pour une sous-catégorie, choisis « Ranger dans »'); return; }
+    const cur0 = id && DB.categories.find(c => c.id === id), nom = par ? par + SEP + leaf : (cur0 && cur0.nom.includes(SEP) && !$('cP') ? topOf(cur0.nom) + SEP + leaf : leaf);
     if (catsOf(acc).some(c => c.nom.toLowerCase() === nom.toLowerCase() && c.id !== id)) { toast('Cette catégorie existe déjà'); return; }
     if (!id) {
       const ordre = Math.max(0, ...DB.categories.map(c => num(c.ordre) || 0)) + 1;
@@ -1824,7 +1867,13 @@ document.addEventListener('submit', ev => {
       if (UI.tab === 'add') draft.cat = nom;
     } else {
       const old = DB.categories.find(c => c.id === id), ops = [upd('Categories', { id, nom, budget: b > 0 ? r2(b) : '' })];
-      if (old && old.nom !== nom) DB.operations.filter(o => o.compte === acc && o.categorie === old.nom).forEach(o => ops.push(upd('Operations', { id: o.id, categorie: nom })));
+      if (old && old.nom !== nom) { // renommée ou rangée ailleurs : sous-catégories, opérations, charges fixes et règles suivent
+        const mv = n => n === old.nom ? nom : String(n || '').startsWith(old.nom + SEP) ? nom + n.slice(old.nom.length) : null;
+        DB.categories.filter(c => c.compte === acc && c.id !== id && mv(c.nom)).forEach(c => ops.push(upd('Categories', { id: c.id, nom: mv(c.nom) })));
+        DB.operations.filter(o => o.compte === acc && mv(o.categorie)).forEach(o => ops.push(upd('Operations', { id: o.id, categorie: mv(o.categorie) })));
+        DB.fixes.filter(x => x.compte === acc && mv(x.categorie)).forEach(x => ops.push(upd('Fixes', { id: x.id, categorie: mv(x.categorie) })));
+        DB.regles.filter(r => (r.compte === acc || !r.compte) && mv(r.categorie)).forEach(r => ops.push(upd('Regles', { id: r.id, categorie: mv(r.categorie) })));
+      }
       commit(ops);
     }
     closeSheet(); toast('Catégorie enregistrée'); return;
@@ -1835,8 +1884,8 @@ document.addEventListener('submit', ev => {
     if (!/^\d{4}-\d{2}-\d{2}$/.test(dt)) { toast('Indique une date'); return; }
     const neg = (num(o.montant) || 0) < 0, lb = $('oL').value.trim(), imp = !!o.ref, ops = [];
     let cat = $('oC') ? $('oC').value : o.categorie;
-    if (cat === '__new') { cat = $('oCnew').value.trim(); if (!cat) { toast('Donne un nom à la catégorie'); return; } }
-    if (cat && !['Virement', 'Correction de solde'].includes(cat) && !catsOf(o.compte).some(c => c.nom.toLowerCase() === cat.toLowerCase())) ops.push(upd('Categories', { id: uid(), compte: o.compte, nom: cat, budget: '', ordre: Math.max(0, ...DB.categories.map(c => num(c.ordre) || 0)) + 1 }));
+    if (cat === '__new') { cat = normCat($('oCnew').value); if (!cat) { toast('Donne un nom à la catégorie'); return; } }
+    if (cat && !['Virement', 'Correction de solde'].includes(cat)) ops.push(...newCatOps(o.compte, cat));
     const kb = f.querySelector('[data-okind][aria-pressed=true]'), type = kb ? kb.dataset.okind : o.type;
     const row = { id: o.id, montant: r2(neg ? -a : a), date: dt, categorie: cat, type: o.type === 'vir' || o.type === 'ajust' ? o.type : type };
     if (!imp) row.libelle = lb;

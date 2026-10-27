@@ -240,3 +240,8 @@ nav.tabs button{font-size:10.5px;padding-inline:0}
 .daysim b{min-width:56px;text-align:right}
 .bctl{display:grid;grid-template-columns:3fr 2fr;gap:10px}.bctl .seg button{white-space:nowrap;padding-inline:4px;font-size:14px}
 @media (max-width:400px){.bctl{grid-template-columns:1fr}}
+/* sous-catégories */
+.cpar{opacity:.65;font-weight:500}
+.item.child{padding-left:30px}
+.bchip.kid{font-size:13px;padding:5px 11px}
+.bdet{border-style:dashed;color:var(--accent);font-size:13px;padding:5px 11px}
