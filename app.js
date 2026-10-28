@@ -2,7 +2,7 @@
    Données : Google Sheet via Google Apps Script. Lien d'accès à usage unique (#inv=CODE&api=URL /exec) échangé contre
    un jeton propre à l'appareil. Chacun voit le compte commun et son compte perso. config.js (apiUrl) facultatif. */
 'use strict';
-const APP_VERSION = '2.0';
+const APP_VERSION = '2.1';
 
 /* ================= Barème impôt (à mettre à jour chaque année) =================
    Barème 2026 sur les revenus 2025, par part. Plafond quotient familial : 1 807 € par demi-part.
@@ -628,10 +628,12 @@ function banners(acc) {
 }
 
 /* ----- Onglet Ponctuel : toutes les opérations, mois par mois ----- */
-const P = { k: null, q: '', f: 'tout', cat: '' };
+const P = { k: null, q: '', f: 'tout', cat: '', view: store.get('le31-pview', 'ponct') };
 function vPonct() {
   const acc = UI.acc;
   if (!started(acc)) return `<section class="view"><div class="note">Démarre d'abord le compte dans l'onglet Mois (import d'un relevé ou solde à la main).</div></section>`;
+  const vseg = `<div class="seg" role="group" aria-label="Vue"><button data-pview="ponct" aria-pressed="${P.view !== 'releve'}">Ponctuel</button><button data-pview="releve" aria-pressed="${P.view === 'releve'}">Relevé complet</button></div>`;
+  if (P.view === 'releve') return vReleve(vseg);
   const k0 = startMonth(acc), lastOp = DB.operations.filter(o => o.compte === acc).reduce((m, o) => String(o.date).slice(0, 7) > m ? String(o.date).slice(0, 7) : m, CUR);
   if (!P.k || P.k < k0) P.k = CUR;
   const q = NORM(P.q.trim()), all = DB.operations.filter(o => o.compte === acc);
@@ -646,7 +648,7 @@ function vPonct() {
   const head = g => q ? mLabel(g) : (+g.slice(8, 10)) + ' ' + MONTHS_L[pm(g.slice(0, 7)).m];
   const row = o => { const v = num(o.montant) || 0, tg = o.type === 'exc' ? '<span class="tag w">exceptionnel</span>' : o.type === 'int' ? '<span class="tag g">entre mes comptes</span>' : o.type === 'vir' ? '<span class="tag">lié</span>' : '';
     return `<button class="item" data-oid="${esc(o.id)}" style="grid-template-columns:1fr auto"><span class="lbl"><b>${esc(nameOf(o))}${tg}</b><small>${o.type === 'ajust' ? 'Correction de solde' : o.categorie ? catHtml(o.categorie) : '<span style="color:var(--warn);font-weight:700">À classer</span>'}${q ? ' · ' + (+String(o.date).slice(8, 10)) + ' ' + MONTHS[pm(String(o.date).slice(0, 7)).m] + ' ' + String(o.date).slice(2, 4) : ''}${o.profil && DB.profils.length > 1 && o.profil !== ME ? ' · ' + esc(pname(o.profil)) : ''}</small></span><span class="amt ${v > 0 ? 'pos' : 'neg'}">${sgn(v)}</span></button>`; };
-  return `<section class="view">
+  return `<section class="view">${vseg}
     ${q ? `<div class="rowhead"><h2>${list.length} résultat${list.length > 1 ? 's' : ''}</h2><span class="sub">tous les mois</span></div>` : `<div class="mnav"><button data-pm="-1" aria-label="Mois précédent" ${P.k <= k0 ? 'disabled' : ''}>‹</button><b>${mLabel(P.k)}</b><button data-pm="1" aria-label="Mois suivant" ${P.k >= lastOp ? 'disabled' : ''}>›</button></div>
     <div class="hero" style="gap:8px"><div class="rowhead"><span class="sub">Dépenses ponctuelles${P.k === CUR ? ' à ce jour' : ''}</span>${P.k <= CUR ? pill : ''}</div>
       <div class="big num" style="font-size:34px">${eur0(spent)}</div>
@@ -660,6 +662,39 @@ function vPonct() {
   </section>`;
 }
 
+
+/* ----- Relevé complet : toutes les entrées et sorties du mois, comme sur le relevé de la banque, avec le solde après chaque ligne ----- */
+function vReleve(vseg) {
+  const acc = UI.acc, k0 = startMonth(acc);
+  if (!P.k || P.k < k0) P.k = CUR;
+  const k = P.k, start = startOf(acc, k), r = calc(acc, k, start);
+  const passed = r.ev.filter(e => e.kind !== 'sim' && !e.late && e.d <= (k < CUR ? r.D : k === CUR ? r.T : 0)), todo = r.ev.filter(e => e.kind !== 'sim' && !passed.includes(e));
+  const ord = (a, b) => a.d - b.d || (b.v > 0) - (a.v > 0);
+  let s = start; const rows = passed.slice().sort(ord).map(e => { s += e.v; return { e, s }; });
+  const inn = passed.filter(e => e.v > 0).reduce((x, e) => x + e.v, 0), out = -passed.filter(e => e.v < 0).reduce((x, e) => x + e.v, 0);
+  const bk = bkRow(acc), bkS = bk && bk.solde !== '' ? num(bk.solde) : null, gap = bkS !== null && k === CUR ? r2(r.bal - bkS) : null;
+  // doublons possibles : même jour, même montant
+  const seen = {}; passed.forEach(e => { const kk = e.d + '|' + r2(e.v); seen[kk] = (seen[kk] || 0) + 1; });
+  const line = (e, sAfter, fut) => {
+    const attr = e.kind === 'fixe' ? `data-fid="${esc(e.id)}"` : e.kind === 'vir' ? `data-vid="${esc(e.id)}"` : `data-oid="${esc(e.id)}"`;
+    const tag = e.kind === 'fixe' ? `<span class="tag ${e.ok ? 'ok' : ''}">fixe${e.ok ? ' ✓' : ''}</span>` : e.kind === 'vir' || e.kind === 'virop' ? '<span class="tag">lié</span>' : e.kind === 'ajust' ? '<span class="tag w">correction</span>' : e.x === 'exc' ? '<span class="tag w">exceptionnel</span>' : e.x === 'int' ? '<span class="tag g">entre mes comptes</span>' : '';
+    const dbl = !fut && seen[e.d + '|' + r2(e.v)] > 1 ? '<span class="tag w">même jour, même montant</span>' : '';
+    const sub = fut ? (e.late ? 'date passée, pas encore vue sur le compte' : 'prévu') : e.kind === 'ajust' ? 'écart corrigé pour coller au solde réel' : e.kind === 'fixe' || e.kind === 'vir' ? (e.ok ? 'vu sur le compte' : 'prévu, pas pointé') : (e.cat ? esc(e.cat) : 'À classer');
+    return `<button class="item rl2" ${attr} style="grid-template-columns:34px 1fr auto"><span class="day">${e.d}</span><span class="lbl"><b>${esc(e.label || '')}${tag}${dbl}</b><small>${sub}</small></span><span class="amt ${e.v > 0 ? 'pos' : 'neg'}">${sgn(e.v)}${sAfter != null ? `<small>solde ${eur(r2(sAfter))}</small>` : ''}</span></button>`;
+  };
+  return `<section class="view">${vseg}
+    <div class="mnav"><button data-pm="-1" aria-label="Mois précédent" ${k <= k0 ? 'disabled' : ''}>‹</button><b>${mLabel(k)}</b><button data-pm="1" aria-label="Mois suivant" ${k >= CUR ? 'disabled' : ''}>›</button></div>
+    <div class="hero" style="gap:10px">
+      <div class="kv"><div><small>Solde au 1er</small><b>${eur(r2(start))}</b></div><div><small>${k === CUR ? 'Solde aujourd\'hui' : 'Solde fin de mois'}</small><b>${eur(r2(s))}</b></div></div>
+      <div class="kv"><div><small>Entrées</small><b class="pos">+${eur(r2(inn))}</b></div><div><small>Sorties</small><b>−${eur(r2(out))}</b></div></div>
+      ${gap !== null ? (Math.abs(gap) >= 1 ? `<div class="note warn"><b>Écart avec la banque : ${sgn(gap)}</b> (banque : ${eur(bkS)}, lu ${esc(bkTime(acc))}). Cherche une ligne en double ou en trop ci-dessous (repère « même jour, même montant » ou « correction ») : touche-la pour la corriger ou la supprimer.</div>` : `<div class="note good">Identique au solde de la banque (${eur(bkS)}, lu ${esc(bkTime(acc))}).</div>`) : ''}
+    </div>
+    ${todo.length ? `<div class="dayhead">À venir d'ici le ${r.D}</div><div class="list">${todo.slice().sort(ord).map(e => line(e, null, true)).join('')}</div>` : ''}
+    <div class="dayhead">Passé · du plus récent au plus ancien</div>
+    <div class="list">${rows.length ? rows.slice().reverse().map(x => line(x.e, x.s)).join('') : '<div class="empty">Aucun mouvement ce mois-ci.</div>'}</div>
+    <div class="hint">Toutes les lignes du mois : charges fixes (✓ = vues sur le compte), virements liés, dépenses et rentrées ponctuelles, corrections de solde. Le solde après chaque ligne se compare au relevé de la banque.</div>
+  </section>`;
+}
 
 /* ----- Onglet Bilan : évolution mois par mois des thèmes choisis ----- */
 const BIL = { n: store.get('le31-bil-n', 12), mode: store.get('le31-bil-mode', 'barres'), exc: false, sel: null, table: false };
@@ -1045,7 +1080,7 @@ const NOMS = [
   [/PICARD/, 'Picard', 'Courses'], [/BIOCOOP/, 'Biocoop', 'Courses'], [/MONOPRIX/, 'Monoprix', 'Courses'], [/FRANPRIX/, 'Franprix', 'Courses'], [/NETTO/, 'Netto', 'Courses'],
   [/BRICO ?DEPOT/, 'Brico Dépôt', 'Maison'], [/CASTORAMA/, 'Castorama', 'Maison'], [/LEROY ?MERLIN/, 'Leroy Merlin', 'Maison'], [/\bIKEA\b/, 'Ikea', 'Maison'],
   [/BRICOMARCHE/, 'Bricomarché', 'Maison'], [/WELDOM/, 'Weldom', 'Maison'], [/JARDILAND/, 'Jardiland', 'Maison'], [/GAMM VERT/, 'Gamm Vert', 'Maison'],
-  [/ELECTRO ?DEPOT/, 'Electro Dépôt', 'Shopping'], [/BOULANGER/, 'Boulanger', 'Shopping'], [/DARTY/, 'Darty', 'Shopping'], [/\bFNAC\b/, 'Fnac', 'Shopping'],
+  [/ELECTRO ?DEPOT/, 'Electro Dépôt', 'Shopping'], [/\bBOULANGER\b/, 'Boulanger', 'Shopping'], [/DARTY/, 'Darty', 'Shopping'], [/\bFNAC\b/, 'Fnac', 'Shopping'],
   [/DECATHLON/, 'Decathlon', 'Shopping'], [/LEBONCOIN/, 'Leboncoin', 'Shopping'], [/CDISCOUNT/, 'Cdiscount', 'Shopping'], [/ALIEXPRESS/, 'AliExpress', 'Shopping'],
   [/VINTED/, 'Vinted', 'Shopping'], [/SHEIN/, 'Shein', 'Shopping'], [/\bTEMU\b/, 'Temu', 'Shopping'], [/KIABI/, 'Kiabi', 'Shopping'], [/PRIMARK/, 'Primark', 'Shopping'],
   [/ACTION LOGEMENT/, 'Action Logement', 'Crédits', 'Revenus'], [/\bACTION\b/, 'Action', 'Shopping'],
@@ -1439,8 +1474,10 @@ function soldeDelta(I) {
   const d = I.solde.date, k = d.slice(0, 7);
   if (k < startMonth(I.acc) || k > CUR) return { delta: 0 };
   const r = calc(I.acc, k, startOf(I.acc, k)), day = Math.min(+d.slice(8, 10), r.D);
-  const rest = impRest(I).filter(t => t.date <= d).reduce((a, t) => a + t.montant, 0);
-  const ptsDiff = I.kept.filter(t => t.match && t.date <= d).reduce((a, t) => { const ev = r.ev.find(e => e.key === t.match); return a + (ev && ev.d <= day ? t.montant - ev.v : 0); }, 0);
+  // nouvelles opérations : celles du mois, et celles d'un mois passé pas encore clôturé
+  const rest = impRest(I).filter(t => t.date <= d && (t.date.slice(0, 7) === k || !clot(I.acc, t.date.slice(0, 7)))).reduce((a, t) => a + t.montant, 0);
+  // charge fixe reconnue : la courbe compte déjà son montant prévu seulement si elle y figure (pas « en retard », date passée)
+  const ptsDiff = I.kept.filter(t => t.match && t.date <= d && t.date.slice(0, 7) === k).reduce((a, t) => { const ev = r.ev.find(e => e.key === t.match), inCurve = ev && !ev.late && ev.d <= day; return a + t.montant - (inCurve ? ev.v : 0); }, 0);
   return { delta: I.solde.montant - (r.curve[day - 1] + rest + ptsDiff) };
 }
 // Règle apprise (nom, catégorie, type) pour un marchand de ce compte
@@ -1798,7 +1835,7 @@ function opSheet(o) {
       <div class="hint" id="kindHint">${kind === 'exc' ? 'Compté dans le solde, pas dans les habitudes ni les prévisions.' : kind === 'int' ? 'Épargne, livret, autre compte à toi : ni dépense ni revenu.' : 'Dépense ou rentrée courante : entre dans les habitudes.'}</div></div>` : ''}
     <div class="field"><label for="oD">Date</label><input id="oD" type="date" value="${esc(o.date)}"></div>
     ${!isVir && !isAdj ? `<button type="button" class="btn ghost" data-tofix="${esc(o.id)}">↻ C'est une charge ${amt > 0 ? 'ou une rentrée ' : ''}régulière : passer en fixe</button>` : ''}
-    <div class="actions"><button type="button" class="btn danger" data-odel=""${esc(o.id)}">Supprimer</button><button class="btn" type="submit">Enregistrer</button></div>
+    <div class="actions"><button type="button" class="btn danger" data-odel="${esc(o.id)}">Supprimer</button><button class="btn" type="submit">Enregistrer</button></div>
     <div id="confirmBox"></div></form>`);
 }
 function balSheet() {
@@ -1915,6 +1952,7 @@ document.addEventListener('click', ev => {
   if (ds.bn) { BIL.n = +ds.bn; store.set('le31-bil-n', BIL.n); render(); return; }
   if (ds.bmode) { BIL.mode = ds.bmode; store.set('le31-bil-mode', BIL.mode); render(); return; }
   if (ds.tofix) { const o = DB.operations.find(x => x.id === ds.tofix); if (o) { closeSheet(); fixFromOp(o); } return; }
+  if (ds.pview) { P.view = ds.pview; store.set('le31-pview', P.view); render(); return; }
   if (ds.pm) { P.k = addM(P.k || CUR, +ds.pm); render(); return; }
   if (ds.pf) { P.f = ds.pf; render(); return; }
   if ('pcat' in ds) { P.f = 'cat'; P.cat = ds.pcat; P.k = CUR; P.q = ''; UI.tab = 'ponct'; render(); scrollTo(0, 0); return; }
