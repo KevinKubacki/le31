@@ -1,22 +1,14 @@
-/* LE 31 — appli téléphone — V1.0
-   Données : Google Sheet via Google Apps Script. Lien d'accès à usage unique (#inv=CODE&api=URL /exec) échangé contre
-   un jeton propre à l'appareil. Chacun voit le compte commun et son compte perso. config.js (apiUrl) facultatif. */
+/* LE 31 — appli téléphone — V3.2 (V3.1.1 + couleurs de l'accueil, jour par jour inversé, tableaux Début/Fin/Évolution ; aucune donnée personnelle dans le code)
+   Pilotage par cycles de paie : Perso du salaire à la veille du suivant, Commun de l'arrivée du virement de début de cycle
+   à la veille du suivant. Opérations lues à la banque (Enable Banking), classées à la main le premier cycle (« À classer »),
+   puis automatiquement quand c'est sûr. Données : Google Sheet via Google Apps Script (Code.gs 3.1). */
 'use strict';
-const APP_VERSION = '2.2';
-
-/* ================= Barème impôt (à mettre à jour chaque année) =================
-   Barème 2026 sur les revenus 2025, par part. Plafond quotient familial : 1 807 € par demi-part.
-   Décote : seuils 1 982 € (seul) / 3 277 € (couple), formules 897 € / 1 483 € − 45,25 % de l'impôt. */
-const IMPOT = {
-  annee: 'Barème 2026 (revenus 2025)',
-  tranches: [[11600, 0], [29579, .11], [84577, .30], [181917, .41], [Infinity, .45]],
-  plafondDemiPart: 1807,
-  decote: { seul: [1982, 897], couple: [3277, 1483], taux: .4525 }
-};
+const APP_VERSION = '3.2';
 
 /* ================= Outils ================= */
 const MONTHS = ['janv.', 'févr.', 'mars', 'avr.', 'mai', 'juin', 'juil.', 'août', 'sept.', 'oct.', 'nov.', 'déc.'];
 const MONTHS_L = ['janvier', 'février', 'mars', 'avril', 'mai', 'juin', 'juillet', 'août', 'septembre', 'octobre', 'novembre', 'décembre'];
+const MONTHS_C = ['janv.', 'févr.', 'mars', 'avr.', 'mai', 'juin', 'juil.', 'août', 'sept.', 'oct.', 'nov.', 'déc.'];
 const FREQ = { M: 'Mensuel', T: 'Trimestriel', A: 'Annuel' };
 const $ = id => document.getElementById(id);
 const pad = n => String(n).padStart(2, '0');
@@ -24,7 +16,7 @@ const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&a
 const num = v => { if (v === '' || v == null) return null; const n = parseFloat(String(v).replace(/\s/g, '').replace(',', '.')); return isNaN(n) ? null : n; };
 const bool = v => v === true || /^(oui|true|vrai|1)$/i.test(String(v || '').trim());
 const r2 = v => Math.round(v * 100) / 100;
-const eur = v => (v || 0).toLocaleString('fr-FR', { style: 'currency', currency: 'EUR', minimumFractionDigits: Math.abs((v || 0) % 1) > 0.004 ? 2 : 0, maximumFractionDigits: 2 });
+const eur = v => (v || 0).toLocaleString('fr-FR', { style: 'currency', currency: 'EUR', minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const eur0 = v => Math.round(v || 0).toLocaleString('fr-FR', { style: 'currency', currency: 'EUR', maximumFractionDigits: 0 });
 const sgn = v => (v > 0.004 ? '+' : v < -0.004 ? '−' : '') + eur(Math.abs(v));
 const fr = v => String(v == null ? '' : v).replace('.', ',');
@@ -44,7 +36,7 @@ const deMois = k => { const n = MONTHS_L[pm(k).m]; return (/^[aeiou]/.test(n) ? 
 const mShort = k => { const { y, m } = pm(k); return MONTHS[m]; };
 let CUR, TODAY, TODAY_ISO;
 function refreshNow() {
-  const n = new Date();
+  const n = window.LE31_TODAY ? new Date(window.LE31_TODAY + 'T12:00:00') : new Date(); // LE31_TODAY : date fixée par les tests
   CUR = mk(n.getFullYear(), n.getMonth()); TODAY = n.getDate(); TODAY_ISO = CUR + '-' + pad(TODAY);
 }
 refreshNow();
@@ -114,7 +106,8 @@ async function join() {
 }
 
 /* ================= Données ================= */
-const TABS = { comptes: 'Comptes', profils: 'Profils', categories: 'Categories', fixes: 'Fixes', virements: 'Virements', operations: 'Operations', pointages: 'Pointages', clotures: 'Clotures', simulations: 'Simulations', regles: 'Regles', parametres: 'Parametres', appareils: 'Appareils', attente: 'Attente', banque: 'Banque', banqueConf: 'BanqueConf' };
+const TABS = { comptes: 'Comptes', profils: 'Profils', parametres: 'Parametres', appareils: 'Appareils', attente: 'Attente', banque: 'Banque', banqueConf: 'BanqueConf',
+  mouvements: 'Mouvements', recurrents: 'Recurrents', cycles: 'Cycles', prevues: 'Prevues', budgets: 'Budgets', apprentissage: 'Apprentissage', livrets: 'Livrets', mvtsLivret: 'MvtsLivret', reglages: 'Reglages' };
 const EMPTY = () => { const o = {}; for (const k in TABS) o[k] = []; return o; };
 let RAW = store.get('le31-data', null);          // dernière copie reçue du serveur
 let QUEUE = store.get('le31-file', []);          // modifications pas encore envoyées
@@ -197,6 +190,7 @@ function received(data, moi) {
   const first = !LOADED; LOADED = true;
   rebuild(); setSync();
   ensurePerso();
+  migrate31();
   setTimeout(bankAuto, 0);
   if (first || before !== JSON.stringify(RAW) + ME) {
     // ne pas re-dessiner pendant qu'on tape dans un champ
@@ -217,924 +211,303 @@ const accRank = a => a.proprietaire === ME ? 0 : !a.proprietaire ? 1 : 2;
 const accs = () => DB.comptes.slice().sort((a, b) => accRank(a) - accRank(b) || (num(a.ordre) || 0) - (num(b.ordre) || 0));
 const accOf = id => DB.comptes.find(a => a.id === id) || { id, nom: id };
 const accName = id => { const a = DB.comptes.find(x => x.id === id); if (a) return a.nom || id; const m = /^perso-(.+)$/.exec(id || ''); return m ? 'Perso ' + (pname(m[1]) || '') : id; };
+const isPerso = acc => !!accOf(acc).proprietaire;
 const isShared = acc => !accOf(acc).proprietaire && DB.profils.length > 1;
 const otherNames = () => DB.profils.filter(p => p.id !== ME).map(p => p.nom).join(', ');
-const otherAcc = id => (accs().find(a => a.id !== id) || {}).id;
 const profiles = () => DB.profils.slice().sort((a, b) => (num(a.ordre) || 0) - (num(b.ordre) || 0));
 const pname = id => (DB.profils.find(p => p.id === id) || {}).nom || '';
-// Sous-catégories : le nom complet est « Parent › Sous-catégorie » (ex. « Véhicule › Carburant »)
-const SEP = ' › ';
-const topOf = n => String(n || '').split(SEP)[0];
-const leafOf = n => { n = String(n || ''); const i = n.lastIndexOf(SEP); return i < 0 ? n : n.slice(i + SEP.length); };
-const inCat = (c, P) => (c || '') === P || String(c || '').startsWith(P + SEP);
-const normCat = s => String(s || '').replace(/\s*(›|>|\/)\s*/g, SEP).replace(/\s+/g, ' ').trim();
-const catHtml = n => n && n.includes(SEP) ? `<span class="cpar">${esc(topOf(n))} › </span>${esc(leafOf(n))}` : esc(n);
-const catsOf = acc => {
-  const l = DB.categories.filter(c => c.compte === acc), o = n => { const t = l.find(x => x.nom === topOf(n)); return num((t || {}).ordre) || 0; };
-  return l.sort((a, b) => o(a.nom) - o(b.nom) || topOf(a.nom).localeCompare(topOf(b.nom)) || (a.nom.includes(SEP) ? 1 : 0) - (b.nom.includes(SEP) ? 1 : 0) || (num(a.ordre) || 0) - (num(b.ordre) || 0));
-};
-// une catégorie proposée (« Carburant ») déplacée sous un parent (« Véhicule › Carburant ») garde sa place
-function resolveCat(acc, c) {
-  if (!c || catsOf(acc).some(x => x.nom === c)) return c;
-  const m = catsOf(acc).find(x => x.nom.includes(SEP) && leafOf(x.nom).toLowerCase() === c.toLowerCase());
-  return m ? m.nom : c;
-}
-// opérations pour créer une catégorie (et son parent s'il n'existe pas)
-function newCatOps(acc, nom, have) {
-  have = have || new Set(catsOf(acc).map(c => c.nom.toLowerCase()));
-  const ops = []; let ordre = Math.max(0, ...DB.categories.map(c => num(c.ordre) || 0));
-  [nom.includes(SEP) ? topOf(nom) : null, nom].filter(Boolean).forEach(n => { if (!have.has(n.toLowerCase())) { have.add(n.toLowerCase()); ops.push(upd('Categories', { id: uid(), compte: acc, nom: n, budget: '', ordre: ++ordre })); } });
-  return ops;
-}
 const param = (k, d) => { const p = DB.parametres.find(x => x.cle === k); return p ? p.valeur : d; };
-const started = acc => num(accOf(acc).soldeDepart) !== null;
-const startMonth = acc => accOf(acc).moisDepart || CUR;
-const clot = (acc, k) => DB.clotures.find(c => c.id === acc + '|' + k);
-const point = (k, cle) => DB.pointages.find(p => p.id === k + '|' + cle);
+const shortAcc = id => isPerso(id) ? 'Perso' : 'Commun';
 
-function occursF(f, k) {
-  if (!bool(f.actif)) return false;
-  if (f.debut && k < f.debut) return false;
-  if (f.fin && k > f.fin) return false;
-  const m = pm(k).m + 1, ref = num(f.moisRef) || (f.debut ? pm(f.debut).m + 1 : 1);
-  if (f.frequence === 'T') return ((m - ref) % 3 + 3) % 3 === 0;
-  if (f.frequence === 'A') return m === ref;
-  return true;
-}
-function occursV(v, k) {
-  if (!bool(v.actif)) return false;
-  if (v.debut && k < v.debut) return false;
-  if (v.fin && k > v.fin) return false;
-  return true;
-}
-const opsOf = (acc, k) => DB.operations.filter(o => o.compte === acc && String(o.date).slice(0, 7) === k);
+/* ================= Dates ================= */
+const DD = iso => new Date(iso + 'T12:00:00Z');
+const addD = (iso, n) => { const d = DD(iso); d.setUTCDate(d.getUTCDate() + n); return d.toISOString().slice(0, 10); };
+const dDiff = (a, b) => Math.round((DD(b) - DD(a)) / 864e5);
+const dayOn = (k, j) => k + '-' + pad(Math.min(Math.max(1, j), dim(k)));   // jour j du mois k (plafonné au dernier jour)
+const fmtJ = iso => iso ? iso.slice(8, 10) + '/' + iso.slice(5, 7) : '';
+const fmtJA = iso => iso ? fmtJ(iso) + '/' + iso.slice(2, 4) : '';
+const WD = ['dim.', 'lun.', 'mar.', 'mer.', 'jeu.', 'ven.', 'sam.'];
+const wd = iso => WD[DD(iso).getUTCDay()];
+const dLong = iso => (+iso.slice(8, 10)) + ' ' + MONTHS[pm(iso.slice(0, 7)).m];
+const dayGap = (a, b) => { const d = Math.abs(a - b); return Math.min(d, 31 - d); }; // le 30 et le 1er sont voisins
+// Un cycle porte le nom du mois qu'il finance : du 27/10 au 27/11 = « novembre » (comme dans le fichier Excel)
+const labelMonth = debut => addD(debut, 10).slice(0, 7);
+const cycName = k => MONTHS_L[pm(k).m] + (pm(k).y !== pm(labelMonth(TODAY_ISO)).y ? ' ' + pm(k).y : '');
 
-/* ================= Calculs ================= */
-function events(acc, k, o) {
-  const D = dim(k), ev = [];
-  DB.fixes.filter(f => f.compte === acc && occursF(f, k)).forEach(f => {
-    const p = point(k, 'f' + f.id), a = p ? num(p.montantReel) : num(f.montant) || 0;
-    ev.push({ d: Math.min(num(f.jour) || 1, D), v: f.sens === '+' ? a : -a, kind: 'fixe', key: 'f' + f.id, id: f.id, label: f.libelle, cat: f.categorie || 'Autre', ok: !!p });
-  });
-  DB.virements.filter(v => (v.de === acc || v.vers === acc) && occursV(v, k)).forEach(v => {
-    const p = point(k, 'v' + v.id), a = p ? num(p.montantReel) : num(v.montant) || 0, out = v.de === acc;
-    ev.push({ d: Math.min(num(v.jour) || 1, D), v: out ? -a : a, kind: 'vir', key: 'v' + v.id, id: v.id, label: v.libelle || (out ? 'Virement vers ' + accName(v.vers) : 'Virement depuis ' + accName(v.de)), cat: out ? '→ ' + accName(v.vers) : '← ' + accName(v.de), ok: !!p, who: v.profil });
-  });
-  opsOf(acc, k).forEach(op => {
-    const d = Math.min(+String(op.date).slice(8, 10) || 1, D);
-    const kind = op.type === 'ajust' ? 'ajust' : op.type === 'vir' ? 'virop' : op.type === 'exc' || op.type === 'int' ? 'exc' : 'ponct';
-    ev.push({ d, v: num(op.montant) || 0, kind, x: kind === 'exc' ? op.type : '', id: op.id, label: op.type === 'ajust' ? 'Correction de solde' : nameOf(op), cat: op.type === 'ajust' ? 'Correction de solde' : op.categorie, who: op.profil, op });
-  });
-  if (o && o.sim) DB.simulations.filter(s => s.compte === acc && s.mois === k && bool(s.actif)).forEach(s => {
-    ev.push({ d: Math.min(15, D), v: -(num(s.montant) || 0), kind: 'sim', label: s.libelle, cat: 'Simulation' });
-  });
-  return ev;
-}
-const isPonct = o => !o.type || o.type === 'ponct';
-const isIncomeCat = c => c === 'Revenus';
-// Dépensé dans une catégorie (dépenses courantes uniquement : ni exceptionnel, ni virement entre comptes ; les remboursements viennent en déduction)
-function spentCat(acc, k, cat, upTo) {
-  if (isIncomeCat(cat)) return 0;
-  const s = -opsOf(acc, k).filter(o => (o.categorie || '') === cat && isPonct(o) && (cat !== '' || (num(o.montant) || 0) < 0) && (upTo == null || +String(o.date).slice(8, 10) <= upTo))
-    .reduce((a, o) => a + (num(o.montant) || 0), 0);
-  return Math.max(0, s);
-}
-// Rentrées ponctuelles (hors fixes, exceptionnelles et virements entre comptes) : catégorie Revenus ou à classer
-function incomeMonth(acc, k, upTo) {
-  return opsOf(acc, k).filter(o => isPonct(o) && (num(o.montant) || 0) > 0 && (isIncomeCat(o.categorie) || !o.categorie) && (upTo == null || +String(o.date).slice(8, 10) <= upTo))
-    .reduce((a, o) => a + (num(o.montant) || 0), 0);
-}
-const median = v => { const s = v.slice().sort((a, b) => a - b), n = s.length; return !n ? 0 : n % 2 ? s[(n - 1) / 2] : (s[n / 2 - 1] + s[n / 2]) / 2; };
-// Habitude : médiane des 3 derniers mois (un mois hors norme ne fausse plus tout), mêlée au mois en cours dès le 10
-function robust(acc, f) {
-  const k0 = startMonth(acc), vals = [];
-  for (let j = 1; j <= 3; j++) { const k = addM(CUR, -j); if (k >= k0) vals.push(f(k)); }
-  if (!vals.length) return null;
-  let h = median(vals);
-  if (TODAY >= 10) { const cur = f(CUR, TODAY) * dim(CUR) / TODAY; h = (h * 2 + (h > 0 ? Math.min(cur, h * 2) : cur)) / 3; }
-  return h;
-}
-function habit(acc, cat) {
-  const ck = 'h|' + acc + '|' + cat; if (ck in CACHE) return CACHE[ck];
-  const c = catsOf(acc).find(x => x.nom === cat), h = robust(acc, (k, up) => spentCat(acc, k, cat, up));
-  return (CACHE[ck] = h === null ? (num(c && c.budget) || 0) : h);
-}
-function habitIn(acc) {
-  const ck = 'hi|' + acc; if (ck in CACHE) return CACHE[ck];
-  return (CACHE[ck] = robust(acc, (k, up) => incomeMonth(acc, k, up)) || 0);
-}
-// catégories de dépenses suivies (avec « à classer » s'il y en a)
-function catList(acc) {
-  const l = catsOf(acc).filter(c => !isIncomeCat(c.nom)).map(c => ({ nom: c.nom, budget: c.budget }));
-  if (DB.operations.some(o => o.compte === acc && !o.categorie && isPonct(o))) l.push({ nom: '', budget: '' });
-  return l;
-}
-const catLabel = c => c || 'À classer';
-const hasHistory = acc => addM(CUR, -1) >= startMonth(acc);
+/* ================= Démarrage V3 d'un compte =================
+   Parametres « v3|<compte> » = { debut: date de début du 1er cycle suivi, mois, montant (revenu du cycle), jour (jour habituel) } */
+// V3.1 : réglages privés d'un compte (onglet Reglages : id = compte|cle, valeur JSON) ; avant, « v3 » était dans Parametres (partagé)
+const regJ = (acc, k) => { const r = DB.reglages.find(x => x.id === acc + '|' + k); if (!r) return null; try { return JSON.parse(r.valeur); } catch (e) { return null; } };
+const regOp = (acc, k, v) => upd('Reglages', { id: acc + '|' + k, compte: acc, cle: k, valeur: JSON.stringify(v) });
+const v3 = acc => { const r = regJ(acc, 'v3'); if (r) return r; try { return JSON.parse(param('v3|' + acc, 'null')); } catch (e) { return null; } };
+const started3 = acc => !!(v3(acc) || {}).debut;
+const defJour = acc => num((v3(acc) || {}).jour) || 26;
+const salLabel = acc => isPerso(acc) ? 'Salaire' : (param('v3nomrev|' + acc, '') || 'Virement de début de cycle');
 
-function calc(acc, k, start, o) {
-  o = o || {};
-  const mode = o.mode || 'budget', D = dim(k), T = k < CUR ? D : k === CUR ? TODAY : 0;
-  const ev = events(acc, k, o);
-  // mois en cours : une charge fixe dont la date est passée mais pas encore pointée (pas vue sur le relevé) reste « à venir »
-  if (k === CUR) ev.forEach(e => { if ((e.kind === 'fixe' || e.kind === 'vir') && !e.ok && e.d <= T) e.late = true; });
-  const when = e => e.late ? Math.min(D, T + 1) : e.d;
-  const realized = ev.filter(e => when(e) <= T).reduce((a, e) => a + e.v, 0), bal = start + realized;
-  const fut = ev.filter(e => when(e) > T).reduce((a, e) => a + e.v, 0);
-  const cats = catList(acc).map(c => {
-    const of = e => e.kind === 'ponct' && (e.cat || '') === c.nom && (c.nom !== '' || e.v < 0);
-    const spent = Math.max(0, -ev.filter(e => of(e) && e.d <= T).reduce((a, e) => a + e.v, 0));
-    const planned = Math.max(0, -ev.filter(e => of(e) && e.d > T).reduce((a, e) => a + e.v, 0));
-    const budget = num(c.budget);
-    // « selon nos budgets » : l'enveloppe si elle existe, sinon l'habitude
-    const target = k < CUR || o.noHab ? 0 : mode === 'habits' || !budget ? habit(acc, c.nom) : budget;
-    return { nom: c.nom, budget, spent, target, remaining: k < CUR ? 0 : Math.max(0, target - spent - planned) };
-  });
-  // rentrées ponctuelles habituelles (remboursements, aides variables…) encore à venir
-  const incGot = ev.filter(e => e.kind === 'ponct' && e.v > 0 && (isIncomeCat(e.cat) || !e.cat)).reduce((a, e) => a + e.v, 0);
-  const incRem = k < CUR || o.noHab ? 0 : Math.max(0, habitIn(acc) - incGot);
-  const varRem = cats.reduce((a, c) => a + c.remaining, 0), end = bal + fut - varRem + incRem;
-  const curve = []; let low = { d: D, v: Infinity };
-  for (let d = 1; d <= D; d++) {
-    let v = start + ev.filter(e => when(e) <= d).reduce((a, e) => a + e.v, 0);
-    if (d > T && D > T) v += (incRem - varRem) * (d - T) / (D - T);
-    curve.push(v); if (d > T && v < low.v) low = { d, v };
+/* ================= Cycles (Calendrier salaires) =================
+   Début d'un cycle : date saisie (Calendrier) > date de la rentrée vue à la banque > estimation (jour habituel du mois d'avant).
+   Fin = veille du cycle suivant. Onglet Cycles : id = compte|mois, manuel = d (date), m (montant), s (solde saisi), b (solde lu à la banque). */
+function cyclesOf(acc) {
+  const ck = 'cy|' + acc; if (CACHE[ck]) return CACHE[ck];
+  const S = v3(acc); if (!S || !S.debut) return (CACHE[ck] = []);
+  const rows = {}; DB.cycles.filter(c => c.compte === acc).forEach(c => rows[c.mois] = c);
+  const sal = {}; allMovs().filter(o => o.compte === acc && o.type === 'sal').forEach(o => { if (!sal[o.lien] || o.date < sal[o.lien].date) sal[o.lien] = o; });
+  const list = [], P = salPlan(acc); let k = S.mois, baseM = num(S.montant) || 0, baseK = S.mois;
+  const n = Math.max(15, diffM(S.mois, labelMonth(TODAY_ISO)) + 15);
+  for (let i = 0; i < n; i++) {
+    const r = rows[k] || {}, so = sal[k], man = String(r.manuel || '');
+    let debut = i === 0 ? S.debut : (man.includes('d') && r.debut) || (so && so.date) || r.debut || dayOn(addM(k, -1), defJour(acc));
+    if (i > 0 && dDiff(list[i - 1].debut, debut) < 15) debut = addD(list[i - 1].debut, 15); // garde-fou : deux débuts trop proches
+    if (man.includes('m') && num(r.montant) !== null && r.montant !== '') { baseM = num(r.montant); baseK = k; }
+    const X = expectedPay(P, baseM, baseK, k);
+    list.push({ i, acc, mois: k, debut, montant: X.total, base: X.base, detail: X, row: r, sal: so || null, man, dateBanque: so ? so.date : '' });
+    k = addM(k, 1);
   }
-  const rev = ev.filter(e => e.v > 0 && e.kind !== 'ajust').reduce((a, e) => a + e.v, 0) + incRem;
-  const chg = -ev.filter(e => (e.kind === 'fixe' || e.kind === 'vir') && e.v < 0).reduce((a, e) => a + e.v, 0);
-  const vari = -ev.filter(e => (e.kind === 'ponct' || e.kind === 'sim' || e.kind === 'virop' || e.kind === 'exc') && e.v < 0).reduce((a, e) => a + e.v, 0) + varRem;
-  return { k, D, T, ev, start, bal, end, cats, varRem, incRem, curve, low, rev, chg, vari, net: end - start };
+  list.forEach((c, i) => c.fin = i + 1 < list.length ? addD(list[i + 1].debut, -1) : addD(c.debut, 30));
+  list.pop();
+  return (CACHE[ck] = list);
 }
-// Solde au 1er du mois k (enchaîne les mois depuis le mois de départ, en repartant des clôtures)
-function startOf(acc, k) {
-  const ck = 's|' + acc + '|' + k; if (ck in CACHE) return CACHE[ck];
-  const A = accOf(acc), k0 = startMonth(acc);
-  let s = num(A.soldeDepart) || 0;
-  for (let m = k0; m < k; m = addM(m, 1)) { const c = clot(acc, m); s = c ? num(c.soldeFin) : calc(acc, m, s).end; }
-  return (CACHE[ck] = s);
-}
-function forecast(acc, n, o) {
-  const ck = 'f|' + acc + '|' + n + '|' + JSON.stringify(o || {}); if (ck in CACHE) return CACHE[ck];
-  const out = []; let s = startOf(acc, CUR);
-  for (let i = 0; i < n; i++) { const r = calc(acc, addM(CUR, i), s, o); out.push(r); s = r.end; }
-  return (CACHE[ck] = out);
-}
-const curMonth = acc => calc(acc, CUR, startOf(acc, CUR), { mode: 'budget', noHab: !UI.hab });
+const cycleAt = (acc, iso) => { const l = cyclesOf(acc); let c = null; for (const x of l) { if (x.debut <= iso) c = x; else break; } return c; };
+const curCycle = acc => cycleAt(acc, TODAY_ISO) || cyclesOf(acc)[0];
+const cycleByMois = (acc, k) => cyclesOf(acc).find(c => c.mois === k);
 
-/* ================= Mois basé sur la paie (V2.2) ================= */
-// On ne touche pas aux mois calendaires (clôtures, Bilan, Relevé complet, solde banque) : seul l'onglet Mois,
-// pour son chiffre de fin et sa courbe, peut afficher la fenêtre « d'une paie à l'autre » plutôt que le 1er → 31.
-// La fenêtre est recalculée à chaque ouverture et ne fait que découper les jours déjà calculés par mois calendaire :
-// un même jour n'appartient jamais qu'à une seule fenêtre, donc rien ne peut être compté deux fois ni oublié.
-const dLabel = iso => (+iso.slice(8, 10)) + ' ' + MONTHS[pm(iso.slice(0, 7)).m];
-const daysBetween = (a, b) => Math.round((new Date(b + 'T12:00:00Z') - new Date(a + 'T12:00:00Z')) / 864e5);
-// Rentrée fixe choisie comme déclencheur (réglage explicite, sinon la plus grosse rentrée mensuelle active)
-function salaryFixeId(acc) {
-  const stored = param('payeFixe|' + acc, '');
-  if (stored && DB.fixes.some(f => f.id === stored && f.compte === acc && bool(f.actif) && f.sens === '+')) return stored;
-  const cands = DB.fixes.filter(f => f.compte === acc && bool(f.actif) && f.sens === '+' && (f.frequence || 'M') === 'M');
-  if (!cands.length) return null;
-  const amtOf = f => { const pts = DB.pointages.filter(p => p.cle === 'f' + f.id).map(p => num(p.montantReel)).filter(x => x != null); return pts.length ? median(pts) : (num(f.montant) || 0); };
-  return cands.slice().sort((a, b) => amtOf(b) - amtOf(a))[0].id;
-}
-function payOn(acc) { const v = param('payeOn|' + acc, ''); return v ? v === 'oui' : !!salaryFixeId(acc); }
-function payHisto(acc) { try { return JSON.parse(param('paye|' + acc, '{}')) || {}; } catch (e) { return {}; } }
-// Dates de la rentrée choisie, mois par mois : réelle si on l'a vue passer (banque/import), sinon son jour habituel
-function payDates(acc, fid) {
-  const f = DB.fixes.find(x => x.id === fid); if (!f) return {};
-  const h = payHisto(acc)[fid] || {}, out = {};
-  for (let k = startMonth(acc); k <= CUR; k = addM(k, 1)) if (occursF(f, k)) out[k] = h[k] || (k + '-' + pad(Math.min(num(f.jour) || 1, dim(k))));
+/* ================= Mouvements ================= */
+let STAGE = null; // mouvements en cours d'ajout (lecture de la banque) : vus par les règles avant l'envoi
+const allMovs = () => DB.mouvements;
+const movsIn = (acc, a, b) => allMovs().filter(o => o.compte === acc && o.date >= a && o.date <= b);
+const recOf = id => DB.recurrents.find(r => r.id === id);
+const budgetsOf = acc => DB.budgets.filter(b => b.compte === acc).sort((a, b) => (num(a.ordre) || 0) - (num(b.ordre) || 0) || a.nom.localeCompare(b.nom));
+const catNames = acc => { const s = new Set(budgetsOf(acc).map(b => b.nom)); return [...s]; };
+const TYPES = { ponct: 'Ponctuel', fixe: 'Fixe', sal: 'Revenu du cycle', ajust: 'Correction', '': 'À classer' };
+
+// Dates d'un récurrent entre a et b (jour plafonné à la fin du mois, comme dans l'Excel)
+function occDates(r, a, b) {
+  if (!bool(r.actif)) return [];
+  const j = num(r.jour) || 1, out = [];
+  for (let k = a.slice(0, 7); k <= b.slice(0, 7); k = addM(k, 1)) {
+    const d = dayOn(k, j);
+    if (d < a || d > b || (r.debut && d < r.debut) || (r.fin && d > r.fin)) continue;
+    out.push(d);
+  }
   return out;
 }
-// Fenêtre en cours : de la dernière paie détectée à la prochaine estimée (ou fixée à la main si elle n'est pas encore passée)
-function payState(acc) {
-  if (!payOn(acc)) return null;
-  const fid = salaryFixeId(acc); if (!fid) return null;
-  const dates = payDates(acc, fid), ks = Object.keys(dates).sort();
-  const past = ks.filter(k => dates[k] <= TODAY_ISO); if (!past.length) return null;
-  const startK = past[past.length - 1], start = dates[startK], idx = ks.indexOf(startK);
-  const gaps = []; for (let i = Math.max(1, idx - 2); i <= idx; i++) if (ks[i - 1] !== undefined) gaps.push(daysBetween(dates[ks[i - 1]], dates[ks[i]]));
-  const avg = gaps.length ? Math.round(gaps.reduce((a, b) => a + b, 0) / gaps.length) : 30;
-  const auto = isoAdd(start, Math.min(40, Math.max(20, avg)));
-  const over = param('payeFin|' + acc, ''), manual = !!(over && over > TODAY_ISO && over > start);
-  return { fixe: fid, start, end: manual ? over : auto, auto, manual };
-}
-// Courbe de solde jour par jour sur la fenêtre de paie : enchaîne les mois calendaires déjà calculés par calc(), sans dupliquer le moteur
-function periodCalc(acc, PS) {
-  const months = []; for (let k = PS.start.slice(0, 7); k <= PS.end.slice(0, 7); k = addM(k, 1)) months.push(k);
-  let s = startOf(acc, months[0]); const dates = [], curve = [];
-  months.forEach(k => {
-    const r = calc(acc, k, s, { mode: 'budget', noHab: !UI.hab });
-    for (let d = 1; d <= r.D; d++) { const date = k + '-' + pad(d); if (date >= PS.start && date < PS.end) { dates.push(date); curve.push(r.curve[d - 1]); } }
-    s = r.end;
+
+/* ================= Calcul d'un cycle (logique du fichier Excel) =================
+   Solde actuel = départ + opérations réelles jusqu'à aujourd'hui (= banque).
+   Atterrissage sans budget = départ + réel + à venir (revenu du cycle pas encore vu, fixes pas encore vus, prévues).
+   Budget restant = somme des « reste » des budgets (cycle en cours), budget complet (cycle futur), 0 (cycle fini).
+   Atterrissage avec budget = sans budget − budget restant. */
+function cycleCalc(acc, c) {
+  const ck = 'cc|' + acc + '|' + c.mois; if (CACHE[ck]) return CACHE[ck];
+  const depart = departOf(acc, c);
+  const real = movsIn(acc, c.debut, c.fin);
+  const isPast = c.fin < TODAY_ISO, isFut = c.debut > TODAY_ISO, isCur = !isPast && !isFut;
+  const tomorrow = addD(TODAY_ISO, 1), place = d => d > TODAY_ISO ? d : (tomorrow <= c.fin ? tomorrow : c.fin);
+  const proj = [];
+  if (!isPast) {
+    // une opération encore « à classer » qui ressemble au revenu du cycle ou à un fixe compte comme déjà vue (pas de double compte)
+    const pend = real.filter(o => !o.type), used = new Set();
+    const take = f => { const o = pend.find(x => !used.has(x.id) && f(x)); if (o) used.add(o.id); return !!o; };
+    const salSeen = real.some(o => o.type === 'sal') || c.i === 0 && c.debut <= TODAY_ISO
+      || take(o => (num(o.montant) || 0) > 0 && Math.abs((num(o.montant) || 0) - c.montant) <= 0.25 * c.montant && Math.abs(dDiff(c.debut, o.date)) <= 4);
+    if (!salSeen && c.montant) proj.push({ d: place(c.debut), v: c.montant, label: salLabel(acc), kind: 'sal', late: c.debut <= TODAY_ISO });
+    DB.recurrents.filter(r => r.compte === acc).forEach(r => {
+      const occ = occDates(r, c.debut, c.fin); if (!occ.length) return;
+      const m = num(r.montant) || 0, key = r.motif;
+      let seen = real.filter(o => o.type === 'fixe' && o.lien === r.id).length;
+      while (seen < occ.length && take(o => ((num(o.montant) || 0) > 0) === (r.sens === '+') && Math.abs(Math.abs(num(o.montant) || 0) - m) <= Math.max(0.1 * m, 3)
+        && ((key && (skOf(o) === key || keyOf(o.libelle || '') === key)) || dayGap(num(r.jour) || 1, +o.date.slice(8, 10)) <= 4))) seen++;
+      const v = (r.sens === '+' ? 1 : -1) * m;
+      occ.slice(seen).forEach(d => proj.push({ d: place(d), v, label: r.libelle, kind: 'fixe', id: r.id, cat: r.categorie, late: d <= TODAY_ISO, prevu: d }));
+    });
+    primeParts(acc, c.debut, c.fin).forEach(p => {
+      const seen = real.some(o => o.lien === p.key) || take(o => (num(o.montant) || 0) > 0 && Math.abs((num(o.montant) || 0) - p.v) <= 0.1 * p.v && Math.abs(dDiff(p.date, o.date)) <= 4);
+      if (!seen) proj.push({ d: place(p.date), v: p.v, label: p.nom, kind: 'prime', late: p.date <= TODAY_ISO, prevu: p.date });
+    });
+    DB.prevues.filter(p => p.compte === acc && !p.etat && p.date >= c.debut && p.date <= c.fin)
+      .forEach(p => proj.push({ d: place(p.date), v: num(p.montant) || 0, label: p.libelle, kind: 'prev', id: p.id, cat: p.categorie, late: p.date <= TODAY_ISO, prevu: p.date }));
+  }
+  const buds = budgetsOf(acc).filter(b => (num(b.budget) || 0) > 0).map(b => {
+    const spent = r2(-real.filter(o => o.type === 'ponct' && o.categorie === b.nom).reduce((a, o) => a + (num(o.montant) || 0), 0));
+    const bud = num(b.budget);
+    return { b, nom: b.nom, budget: bud, spent, reste: r2(Math.max(0, bud - spent)), over: r2(Math.max(0, spent - bud)) };
   });
-  const D = dates.length, T = dates.filter(d => d <= TODAY_ISO).length;
-  const bal = T ? curve[T - 1] : (num(accOf(acc).soldeDepart) || 0), end = curve[D - 1];
-  let low = { d: D, v: Infinity }; for (let i = T; i < D; i++) if (curve[i] < low.v) low = { d: i + 1, v: curve[i] };
-  return { D, T, dates, curve, bal, end, low };
+  const reserve = r2(isPast ? 0 : isFut ? buds.reduce((a, x) => a + x.budget, 0) : buds.reduce((a, x) => a + x.reste, 0));
+  const items = real.map(o => ({ d: o.date, v: num(o.montant) || 0, label: nameOf(o), kind: o.type || 'todo', id: o.id, cat: o.categorie, real: true })).concat(proj);
+  const byDay = {}; items.forEach(it => (byDay[it.d] = byDay[it.d] || []).push(it));
+  const days = []; let bal = depart;
+  for (let d = c.debut; d <= c.fin; d = addD(d, 1)) { const l = byDay[d] || []; const mv = r2(l.reduce((a, x) => a + x.v, 0)); bal = r2(bal + mv); days.push({ d, items: l, mv, bal }); }
+  const sumReal = l => r2(l.reduce((a, o) => a + (num(o.montant) || 0), 0));
+  const realEnd = r2(depart + sumReal(real));
+  const atterSans = isPast ? realEnd : (days.length ? days[days.length - 1].bal : depart);
+  const res = { c, depart, real, proj, days, buds, reserve, isPast, isCur, isFut, realEnd,
+    soldeActuel: r2(depart + sumReal(real.filter(o => o.date <= TODAY_ISO))), atterSans, atterAvec: r2(atterSans - reserve),
+    todo: real.filter(o => !o.type).length };
+  return (CACHE[ck] = res);
 }
-// Marchand avec deux usages distincts selon le montant (ex. MAGASIN U = courses ou carburant)
-function seuilRule(acc, lib) { try { return JSON.parse(param('seuilCat|' + acc + '|' + keyOf(lib), '')) || null; } catch (e) { return null; } }
-
-function status(end, seuil) {
-  if (end < 0) return { c: 'bad', t: 'Dépassement prévu', msg: `Il manque ${eur0(-end)} pour finir le mois` };
-  if (end < seuil) return { c: 'warn', t: 'Budget serré', msg: `Marge de ${eur0(end)}, sous le seuil de ${eur0(seuil)}` };
-  return { c: 'good', t: 'Budget tenu', msg: `Épargne possible : ${eur0(end - seuil)}` };
+// Solde de départ : saisi (Calendrier) ou lu à la banque, sinon fin réelle du cycle précédent (fini) ou son atterrissage avec budget
+function departOf(acc, c) {
+  const s = num(c.row.soldeDepart); if (s !== null && c.row.soldeDepart !== '') return s;
+  if (c.i === 0) return 0;
+  const p = cyclesOf(acc)[c.i - 1], P = cycleCalc(acc, p);
+  return P.isPast ? P.realEnd : P.atterAvec;
 }
-const seuilOf = acc => num(accOf(acc).seuil) || 0;
-function margeHab(acc) {
-  const ck = 'mh|' + acc; if (ck in CACHE) return CACHE[ck];
-  const r = forecast(acc, 7, { mode: 'habits' }).slice(1);
-  return (CACHE[ck] = r.reduce((a, x) => a + x.net, 0) / r.length);
-}
-function firstUnclosed(acc) {
-  if (!started(acc)) return null;
-  for (let k = startMonth(acc); k < CUR; k = addM(k, 1)) if (!clot(acc, k)) return k;
-  return null;
-}
-
-/* ================= Simulations ================= */
-const simI = s => diffM(CUR, s.mois);
-const activeSims = acc => DB.simulations.filter(s => s.compte === acc && bool(s.actif) && simI(s) >= 0).sort((a, b) => simI(a) - simI(b) || String(a.id).localeCompare(String(b.id)));
-function reservedBefore(s, list) {
-  const idx = list.findIndex(x => x.id === s.id), prev = idx < 0 ? list : list.slice(0, idx), k = simI(s);
-  if (k <= 0) return { avg: 0, names: [] };
-  let tot = 0; const names = new Set();
-  for (let mo = 1; mo <= k; mo++) prev.forEach(p => { const pk = simI(p); if (pk > 0 && mo <= pk) { tot += num(p.montant) / pk; names.add(p.libelle); } });
-  return { avg: tot / k, names: [...names] };
-}
-function simsSummary(acc) {
-  const all = activeSims(acc), list = all.filter(x => simI(x) > 0), marge = margeHab(acc);
-  if (all.length < 2) return null;
-  let peak = 0; const maxK = list.length ? Math.max(...list.map(simI)) : 0;
-  for (let mo = 1; mo <= maxK; mo++) peak = Math.max(peak, list.filter(x => mo <= simI(x)).reduce((a, x) => a + num(x.montant) / simI(x), 0));
-  return { n: all.length, total: all.reduce((a, x) => a + num(x.montant), 0), peak, marge, ratio: marge > 0 ? peak / marge : Infinity };
-}
-function simPlan(s) {
-  const acc = s.compte, margeTot = margeHab(acc), k = simI(s), amt = num(s.montant) || 0;
-  const need = k > 0 ? amt / k : amt;
-  const res = reservedBefore(s, bool(s.actif) ? activeSims(acc) : activeSims(acc).concat([s]));
-  const marge = margeTot - res.avg, ratio = marge > 0 ? need / marge : Infinity;
-  const c = ratio <= 0.5 ? 'good' : ratio <= 0.9 ? 'warn' : 'bad';
-  const label = c === 'good' ? 'Faisable' : c === 'warn' ? 'Tendu' : 'Difficile';
-  let over = null;
-  catsOf(acc).filter(x => num(x.budget)).forEach(x => { const h = habit(acc, x.nom) - num(x.budget); if (h > 15 && (!over || h > over.d)) over = { n: x.nom, d: h }; });
-  const kmin = marge > 0 ? Math.ceil(amt / (marge * 0.5)) : null;
-  const end = forecast(acc, Math.max(6, k + 2), { sim: true, mode: 'habits' });
-  const neg = end.find(r => r.low.v < 0);
-  let txt;
-  if (k === 0) txt = `L'achat tombe ce mois-ci : il est pris directement sur la fin de mois.`;
-  else if (res.avg > 0) txt = `Il reste habituellement ${eur0(margeTot)} en fin de mois, dont <b>${eur0(res.avg)}</b> déjà réservés pour ${res.names.map(esc).join(', ')}. Mettre <b>${eur0(need)}</b> de côté représente <b>${marge > 0 ? Math.round(ratio * 100) + ' %' : 'plus que tout'}</b> de ce qui reste disponible (${eur0(marge)}).`;
-  else txt = `Mettre <b>${eur0(need)}</b> de côté chaque mois représente <b>${marge > 0 ? Math.round(ratio * 100) + ' %' : 'plus que tout'}</b> de ce qu'il reste habituellement en fin de mois (${eur0(margeTot)}).`;
-  if (!hasHistory(acc)) txt += ` <i>Peu d'historique pour l'instant : les budgets servent d'estimation.</i>`;
-  if (over) txt += ` D'après les saisies, l'enveloppe <b>${esc(over.n)}</b> est dépassée de ${eur0(over.d)} par mois en moyenne : c'est pris en compte.`;
-  if (c !== 'good' && kmin && kmin > k) txt += ` Plus confortable en visant <b>${mLabel(addM(CUR, kmin))}</b> (${eur0(amt / kmin)}/mois).`;
-  if (neg && bool(s.actif)) txt += ` Attention, découvert possible en ${mLabel(neg.k)}.`;
-  if (!bool(s.actif)) txt = `<i>Simulation désactivée, évaluée comme si on l'ajoutait aux autres.</i> ` + txt;
-  return { k, need, c: neg && bool(s.actif) ? 'bad' : c, label: neg && bool(s.actif) ? 'Risqué' : label, txt };
+const departKind = c => num(c.row.soldeDepart) !== null && c.row.soldeDepart !== '' ? (c.man.includes('b') ? 'banque' : 'saisi') : c.i === 0 ? 'à renseigner' : c.fin < TODAY_ISO || c.debut <= TODAY_ISO ? 'réel' : 'projeté';
+// Solde calculé à une date (pour recaler sur la banque)
+function balanceAt(acc, iso) {
+  const c = cycleAt(acc, iso); if (!c) return null;
+  return r2(departOf(acc, c) + movsIn(acc, c.debut, iso).reduce((a, o) => a + (num(o.montant) || 0), 0));
 }
 
-/* ================= Impôts ================= */
-function bareme(q) { let t = 0, p = 0; for (const [l, r] of IMPOT.tranches) { if (q > p) t += (Math.min(q, l) - p) * r; p = l; } return t; }
-function taxParams() {
-  return { mode: param('impMode', 'commune'), kids: num(param('impEnfants')) || 0, sal1: num(param('impSal1')) || 0, sal2: num(param('impSal2')) || 0, autres: num(param('impAutres')) || 0, autresAb: num(param('impAutresAb')) || 50, taux: num(param('impTaux')) || 0 };
+/* ================= Simulation (même logique que l'onglet « Simulation achat » de l'Excel) =================
+   12 cycles à partir du cycle en cours ; un achat est possible si le solde de fin AVEC budget reste ≥ 0
+   à la fin de son cycle et de tous les suivants. */
+function simBase(acc) {
+  const cy = cyclesOf(acc), cur = curCycle(acc); if (!cur) return [];
+  return cy.slice(cur.i, cur.i + 12).map(c => ({ c, end: cycleCalc(acc, c).atterAvec }));
 }
-function calcTax(X, extra) {
-  const couple = X.mode === 'commune', sal = (X.sal1 + extra) + (couple ? X.sal2 : 0);
-  const Rsal = Math.max(0, sal * 0.9), Raut = X.autres * (1 - X.autresAb / 100), R = Rsal + Raut;
-  const base = couple ? 2 : 1, parts = base + (X.kids <= 2 ? X.kids * 0.5 : 1 + (X.kids - 2));
-  const Ifull = bareme(R / parts) * parts, Ibase = bareme(R / base) * base, cap = (parts - base) * 2 * IMPOT.plafondDemiPart;
-  let I = Math.max(Ifull, Ibase - cap); const plaf = Ibase - cap > Ifull;
-  const [sd, dx] = couple ? IMPOT.decote.couple : IMPOT.decote.seul; let dec = 0;
-  if (I < sd) { dec = Math.min(I, Math.max(0, dx - IMPOT.decote.taux * I)); I -= dec; }
-  const q = R / parts, TR = IMPOT.tranches; let k = 0; while (q > TR[k][0]) k++;
-  const share = R > 0 ? Rsal / R : 0;
-  return { R, parts, I, dec, plaf, q, tmi: TR[k][1], toNext: (TR[k][0] - q) * parts / 0.9, nextRate: TR[Math.min(k + 1, TR.length - 1)][1], tauxEst: sal > 0 ? I * share / sal * 100 : 0, prelev: sal * X.taux / 100, duSal: I * share, sal };
+const simIdx = (base, iso) => { if (!base.length) return -1; if (iso < base[0].c.debut) return 0; return base.findIndex(x => iso >= x.c.debut && iso <= x.c.fin); };
+function simAchat(base, a) {
+  const j = simIdx(base, a.date), m = num(a.montant) || 0;
+  if (j < 0 || !(m > 0)) return null;
+  const after = base.slice(j), low = r2(Math.min(...after.map(x => x.end - m))), max = r2(Math.max(0, Math.min(...after.map(x => x.end))));
+  let conseil = null;
+  if (low < 0) for (let jj = j + 1; jj < base.length; jj++) if (Math.min(...base.slice(jj).map(x => x.end)) >= m) { conseil = base[jj].c.debut; break; }
+  return { j, ok: low >= 0, low, max, conseil };
+}
+function simAll(base, achats) {
+  const ends = base.map(x => x.end);
+  achats.forEach(a => { const j = simIdx(base, a.date), m = num(a.montant) || 0; if (j >= 0 && m > 0) for (let k = j; k < ends.length; k++) ends[k] -= m; });
+  return { ends: ends.map(r2), ok: ends.every(v => v >= 0) };
+}
+// Crédit : mensualité chaque mois au jour du 1er prélèvement (plafonné à la fin du mois), entre les deux dates ;
+// « remplace » : la charge fixe choisie n'est plus prélevée à partir du 1er prélèvement ; frais débités à la 1re date.
+function simCredit(acc, base, cr) {
+  const M = num(cr.mens) || 0; if (!base.length || !cr.debut) return null;
+  const jour = +cr.debut.slice(8, 10), fin = cr.fin || '9999-12-31', rp = cr.remplace && recOf(cr.remplace);
+  let cumPay = 0, cumOther = 0, low = Infinity, maxM = Infinity;
+  const rows = base.map(x => {
+    let n = 0;
+    for (let k = x.c.debut.slice(0, 7); k <= x.c.fin.slice(0, 7); k = addM(k, 1)) { const d = dayOn(k, jour); if (d >= x.c.debut && d <= x.c.fin && d >= cr.debut && d <= fin) n++; }
+    let saved = 0;
+    if (rp && rp.sens !== '+') { const a0 = cr.debut > x.c.debut ? cr.debut : x.c.debut; if (a0 <= x.c.fin) saved = occDates(rp, a0, x.c.fin).length * (num(rp.montant) || 0); }
+    const frais = cr.debut >= x.c.debut && cr.debut <= x.c.fin ? (num(cr.frais) || 0) : 0;
+    cumPay += n; cumOther += saved - frais;
+    const end = r2(x.end + cumOther - M * cumPay);
+    low = Math.min(low, end);
+    if (cumPay > 0) maxM = Math.min(maxM, (x.end + cumOther) / cumPay);
+    return { c: x.c, n, end, base: x.end };
+  });
+  return { rows, ok: low >= 0, low: r2(low), impact: r2(cumOther - M * cumPay), nPay: cumPay, max: maxM === Infinity ? null : r2(Math.max(0, Math.floor(maxM * 100) / 100)) };
 }
 
-/* ================= Graphiques ================= */
-function niceStep(s) { if (!(s > 0)) return 100; const p = Math.pow(10, Math.floor(Math.log10(s))), n = s / p; return (n < 1.5 ? 1 : n < 3 ? 2 : n < 7 ? 5 : 10) * p; }
-function curveSVG(r, seuil, dv) {
-  const W = 340, H = 150, L = 44, R = 8, Tp = 10, B = 22, vals = r.curve.concat([0, seuil]);
-  let mn = Math.min(...vals), mx = Math.max(...vals); const padv = (mx - mn) * .08 || 50; mn -= padv; mx += padv;
-  const x = d => L + (d - 1) * (W - L - R) / (r.D - 1), yv = v => Tp + (mx - v) * (H - Tp - B) / (mx - mn);
-  const step = niceStep((mx - mn) / 4), ticks = []; for (let t = Math.ceil(mn / step) * step; t <= mx; t += step) ticks.push(t);
-  const pts = r.curve.map((v, i) => [x(i + 1), yv(v)]), T = Math.max(1, r.T);
-  let g = ticks.map(t => `<line x1="${L}" x2="${W - R}" y1="${yv(t)}" y2="${yv(t)}" stroke="var(--line)"/><text x="${L - 6}" y="${yv(t) + 4}" text-anchor="end" font-size="10" fill="var(--muted)">${Math.round(t)}</text>`).join('');
-  g += `<line x1="${L}" x2="${W - R}" y1="${yv(seuil)}" y2="${yv(seuil)}" stroke="var(--warn)" stroke-dasharray="3 3" stroke-width="1.2"/><text x="${W - R}" y="${yv(seuil) - 4}" text-anchor="end" font-size="10" fill="var(--warn)">seuil ${Math.round(seuil)} €</text>`;
-  if (mn < 0) g += `<line x1="${L}" x2="${W - R}" y1="${yv(0)}" y2="${yv(0)}" stroke="var(--bad)" stroke-width="1.2"/>`;
-  [1, 10, 20, r.D].forEach(d => g += `<text x="${x(d)}" y="${H - 6}" text-anchor="middle" font-size="10" fill="var(--muted)">${d}</text>`);
-  const past = pts.slice(0, T).map(p => p.join(',')).join(' ');
-  g += `<polygon points="${x(1)},${yv(mn)} ${past} ${x(T)},${yv(mn)}" fill="var(--accent)" opacity=".10"/>`;
-  g += `<polyline points="${past}" fill="none" stroke="var(--accent)" stroke-width="2.4" stroke-linejoin="round"/>`;
-  g += `<polyline points="${pts.slice(T - 1).map(p => p.join(',')).join(' ')}" fill="none" stroke="var(--accent)" stroke-width="2" stroke-dasharray="5 4"/>`;
-  if (r.T) g += `<circle cx="${x(T)}" cy="${yv(r.curve[T - 1])}" r="4.5" fill="var(--accent)" stroke="var(--surface)" stroke-width="2"/>`;
-  g += `<circle cx="${x(r.D)}" cy="${yv(r.end)}" r="4" fill="var(--surface)" stroke="var(--accent)" stroke-width="2"/>`;
-  if (dv) { const v = r.curve[dv - 1]; g += `<line x1="${x(dv)}" x2="${x(dv)}" y1="${Tp}" y2="${H - B}" stroke="var(--ink)" stroke-width="1" opacity=".35"/><circle cx="${x(dv)}" cy="${yv(v)}" r="5.5" fill="var(--surface)" stroke="var(--ink)" stroke-width="2.4"/>`; }
-  return `<svg class="curve" viewBox="0 0 ${W} ${H}" role="img" aria-label="Évolution du solde sur le mois">${g}</svg>`;
+/* ================= V3.1 : évolution du salaire =================
+   Réglage « salaire » : { moisHausse: 6, rattrapDepuis: 1, hausses: { "2027": 2 }, primes: [{ id, nom, type: "paie"|"part", mois, jour, montants: { "2026": 2000 } }] }
+   La paie d'un mois ouvre le cycle du mois suivant (paie de juin → cycle de juillet). */
+const salPlan = acc => regJ(acc, 'salaire') || { moisHausse: 6, rattrapDepuis: 1, hausses: {}, primes: [] };
+const payMonth = k => addM(k, -1);
+// pourcentage d'une année : celui saisi, sinon le dernier saisi avant (les années suivantes le reprennent)
+function pctOf(P, y) {
+  const ys = Object.keys(P.hausses || {}).map(Number).filter(x => !isNaN(x)).sort((a, b) => a - b);
+  if (!ys.length || y < ys[0]) return 0;
+  const k = ys.filter(x => x <= y).pop(); return num(P.hausses[k]) || 0;
 }
-
-/* ================= Interface ================= */
-const UI = { acc: store.get('le31-compte', 'perso'), tab: 'home', foreTab: 'budget', horizon: 6, mode: 'habits', theme: store.get('le31-theme', 'auto'), hab: store.get('le31-hab', true), dayV: null };
-const draft = { sens: '-', cat: null, to: null };
-const main = $('main');
-
-function render() {
-  refreshNow();
-  if (!DB.comptes.find(a => a.id === UI.acc) && DB.comptes.length) UI.acc = accs()[0].id;
-  const L = $('monthLbl'); if (L) L.textContent = mLabel(CUR);
-  $('foot').textContent = 'Le 31 · V' + APP_VERSION;
-  document.querySelectorAll('nav.tabs button, #gearBtn').forEach(b => b.setAttribute('aria-current', b.dataset.tab === UI.tab));
-  const blocked = BK.view === 'retour' ? null : gate(), imp = !blocked && UI.imp && IMP;
-  const bkv = !blocked && !imp && (BK.view || (bkPend() ? 'map' : null));
-  $('tabs').hidden = !!blocked || !!imp || !!bkv; $('gearBtn').hidden = !!blocked || !!imp || !!bkv;
-  $('top').querySelector('.seg').hidden = !!blocked || !!imp || accs().length < 2 || (UI.tab === 'fore' && UI.foreTab === 'tax') || UI.tab === 'set';
-  $('accSeg').innerHTML = accs().map(a => `<button data-acc="${esc(a.id)}" aria-pressed="${a.id === UI.acc}">${esc(a.nom)}</button>`).join('');
-  try {
-    main.innerHTML = blocked || (imp ? vImport() : bkv ? vBank() : ({ home: vHome, fixed: vFixed, add: vAdd, ponct: vPonct, bilan: vBilan, fore: vFore, set: vSet }[UI.tab] || vHome)());
-  } catch (e) {
-    console.error(e);
-    main.innerHTML = `<section class="view"><div class="note bad">Un problème d'affichage est survenu : ${esc(e.message)}. Va dans Réglages ou recharge l'appli.</div></section>`;
+// montant d'une prime pour une année : celui saisi, sinon celui de l'année d'avant la plus proche
+function primeAmt(p, y) {
+  const m = p.montants || {}; const ys = Object.keys(m).map(Number).filter(x => x <= y && num(m[x]) > 0).sort((a, b) => a - b);
+  return ys.length ? num(m[ys.pop()]) : 0;
+}
+// Paie attendue pour le cycle k : salaire de base augmenté + rattrapage (paie de l'augmentation) + primes versées avec la paie
+function expectedPay(P, baseM, baseK, k) {
+  const mh = Math.min(12, Math.max(1, num(P.moisHausse) || 6)), rd = Math.min(mh, Math.max(1, num(P.rattrapDepuis) || 1));
+  const pk = payMonth(k), p0 = payMonth(baseK);
+  let base = baseM, rappel = 0, hausse = 0;
+  for (let y = +p0.slice(0, 4); y <= +pk.slice(0, 4); y++) {
+    const e = y + '-' + pad(mh), pc = pctOf(P, y);
+    if (!pc || e <= p0 || e > pk) continue;
+    const before = base; base = r2(base * (1 + pc / 100));
+    if (e === pk) { hausse = pc; rappel = r2((base - before) * (mh - rd)); }
   }
-  setSync(); bankChip();
+  const primes = (P.primes || []).filter(p => p.type !== 'part' && +p.mois === +pk.slice(5, 7)).map(p => ({ nom: p.nom, v: primeAmt(p, +pk.slice(0, 4)) })).filter(p => p.v > 0);
+  return { base: r2(base), rappel, hausse, primes, total: r2(base + rappel + primes.reduce((a, p) => a + p.v, 0)) };
 }
-// Écrans bloquants : appli pas encore reliée, lien refusé, accès coupé, premier chargement, premier lancement
-function gate() {
-  const logo = `<div class="logo31">Le 31<span>.</span></div>`;
-  const paste = `<form class="form" id="keyForm" novalidate style="text-align:left"><div class="field"><label for="keyIn">Colle ici le lien reçu</label><input id="keyIn" placeholder="https://…#inv=…" autocomplete="off"></div><button class="btn" type="submit">Relier l'appli</button></form>`;
-  if (INV() && apiOk()) {
-    if (IOS && !STANDALONE() && !JOIN.iosOk) return `<section class="view center">${logo}<h2>Installe d'abord Le 31</h2>
-      <p class="hint" style="font-size:14px">Sur iPhone et iPad : bouton <b>Partager</b> puis <b>Sur l'écran d'accueil</b>. Ouvre ensuite Le 31 depuis l'écran d'accueil : si l'appli te le demande, colle le lien reçu.</p>
-      <p class="hint">Ce lien ne marche qu'une fois, sur un seul appareil.</p><button class="btn ghost" data-iosok="1">Utiliser Le 31 dans Safari plutôt</button></section>`;
-    const E = JOIN.err;
-    if (!JOIN.busy && E) {
-      const api = API(), short = api.replace(/^https:\/\/script\.google\.com\/macros\/s\/(.{6}).*(.{6})\/exec$/, '…/s/$1…$2/exec');
-      const why = E === 'delai' ? "Le serveur n'a pas répondu à temps."
-        : E === 'reseau' ? "Impossible de joindre le serveur (réseau, ou adresse du serveur incorrecte dans le lien)."
-        : E === 'html' ? "L'adresse du serveur contenue dans le lien ne répond pas comme prévu : ce n'est sans doute pas la bonne (ou le déploiement n'est pas en « Tout le monde »)."
-        : E === 'serveur' ? 'Le serveur a rencontré une erreur.' : 'Erreur : ' + esc(E);
-      return `<section class="view center">${logo}<h2>Connexion impossible</h2>
-        <p class="hint" style="font-size:14px">${why}</p>
-        ${JOIN.detail ? `<div class="note" style="text-align:left;font-size:12px;word-break:break-word">Détail : ${esc(JOIN.detail)}</div>` : ''}
-        <div class="note" style="text-align:left;font-size:13px">Adresse du serveur dans ton lien :<br><b style="word-break:break-all">${esc(short)}</b><br>Elle doit être identique à l'<b>URL de l'application Web</b> du déploiement. Ouverte dans Safari, elle doit afficher « Le 31 : serveur actif ». Sinon, recrée le lien depuis le menu « Le 31 » du Google Sheet en collant la bonne adresse.</div>
-        <button class="btn" data-joinretry="1">Réessayer</button>
-        ${paste}</section>`;
+// Primes versées à part (ex. ½ 13ème mois le 15 juin et le 15 décembre) entre a et b
+function primeParts(acc, a, b) {
+  const P = salPlan(acc), out = [];
+  (P.primes || []).filter(p => p.type === 'part').forEach(p => {
+    for (let y = +a.slice(0, 4); y <= +b.slice(0, 4); y++) {
+      const d = dayOn(y + '-' + pad(+p.mois || 12), +p.jour || 15), v = primeAmt(p, y);
+      if (d >= a && d <= b && v > 0) out.push({ id: p.id, nom: p.nom, date: d, v, key: 'pr|' + p.id + '|' + y });
     }
-    return `<section class="view center">${logo}<p class="hint">Connexion de cet appareil…</p></section>`;
+  });
+  return out;
+}
+
+/* ================= V3.1 : épargne =================
+   Livrets(compte = compte courant propriétaire, type livret|invest, pointZero au dateZero, objectif mensuel).
+   Un mouvement du compte courant alimente un livret : type « epargne » (livret choisi), fixe lié à un livret, prévue liée.
+   Sortie du compte = versement sur le livret ; rentrée depuis le livret = retrait. MvtsLivret : intérêts (recalage) et mouvements à la main. */
+const livretsOf = acc => DB.livrets.filter(l => l.compte === acc && l.actif !== 'non').sort((a, b) => (num(a.ordre) || 0) - (num(b.ordre) || 0));
+const livOf = id => DB.livrets.find(l => l.id === id);
+const livretOfMov = o => o.type === 'epargne' ? o.livret || '' : o.type === 'fixe' ? ((recOf(o.lien) || {}).livret || '') : o.livret || '';
+const monthEnd = k => k + '-' + pad(dim(k));
+function livFlows(L) {
+  const ck = 'lf|' + L.id; if (CACHE[ck]) return CACHE[ck];
+  const out = [];
+  DB.mouvements.filter(o => o.compte === L.compte && o.date > L.dateZero && livretOfMov(o) === L.id).forEach(o => { const v = r2(-(num(o.montant) || 0)); out.push({ date: o.date, v, kind: v >= 0 ? 'vers' : 'retr', label: nameOf(o), oid: o.id }); });
+  DB.mvtsLivret.filter(m => m.livret === L.id && m.date > L.dateZero).forEach(m => { const v = num(m.montant) || 0; out.push({ date: m.date, v, kind: m.type === 'interets' ? 'int' : v >= 0 ? 'vers' : 'retr', label: m.libelle || (m.type === 'interets' ? 'Intérêts' : 'Mouvement'), mid: m.id }); });
+  return (CACHE[ck] = out.sort((a, b) => a.date.localeCompare(b.date)));
+}
+// À venir sur un mois : fixes liés pas encore vus ce mois-là, prévues liées (mois en cours et suivants)
+function livProj(L, k) {
+  if (k < CUR) return [];
+  const a = k + '-01', b = monthEnd(k), out = [];
+  DB.recurrents.filter(r => r.compte === L.compte && r.livret === L.id).forEach(r => {
+    const occ = occDates(r, a, b), seen = DB.mouvements.filter(o => o.type === 'fixe' && o.lien === r.id && o.date >= a && o.date <= b).length;
+    occ.slice(seen).forEach(d => out.push({ date: d, v: (r.sens === '+' ? -1 : 1) * (num(r.montant) || 0), kind: r.sens === '+' ? 'retr' : 'vers', label: r.libelle, prevu: true }));
+  });
+  DB.prevues.filter(p => p.compte === L.compte && p.livret === L.id && !p.etat && p.date >= a && p.date <= b)
+    .forEach(p => { const v = -(num(p.montant) || 0); out.push({ date: p.date, v, kind: v >= 0 ? 'vers' : 'retr', label: p.libelle, prevu: true }); });
+  return out;
+}
+const livSolde = (L, iso) => r2((num(L.pointZero) || 0) + livFlows(L).filter(f => f.date <= iso).reduce((a, f) => a + f.v, 0));
+// Mois du livret : du mois qui suit le point zéro jusqu'à `last` ; réel jusqu'à aujourd'hui, prévu ensuite
+function livMonths(L, last) {
+  const ck = 'lm|' + L.id + '|' + last; if (CACHE[ck]) return CACHE[ck];
+  const out = []; let bal = num(L.pointZero) || 0;
+  for (let k = addM(L.dateZero.slice(0, 7), 1); k <= last; k = addM(k, 1)) {
+    const fl = livFlows(L).filter(f => f.date.slice(0, 7) === k), pr = livProj(L, k), all = fl.concat(pr);
+    const vers = r2(all.filter(f => f.kind === 'vers').reduce((a, f) => a + f.v, 0)), retr = r2(-all.filter(f => f.kind === 'retr').reduce((a, f) => a + f.v, 0)), int = r2(all.filter(f => f.kind === 'int').reduce((a, f) => a + f.v, 0));
+    const realNet = r2(fl.filter(f => f.kind !== 'int').reduce((a, f) => a + f.v, 0)), projNet = r2(pr.reduce((a, f) => a + f.v, 0));
+    bal = r2(bal + vers - retr + int);
+    out.push({ k, vers, retr, int, net: r2(vers - retr), fin: bal, realNet, projNet, real: fl, proj: pr, st: k < CUR ? 'real' : k === CUR ? 'cur' : 'fut' });
   }
-  if (!JETON() || !apiOk() || isAccessErr(SYNC.error)) {
-    const E = JOIN.err, cut = isAccessErr(SYNC.error) && JETON();
-    const msg = E === 'utilisee' ? "Ce lien a déjà servi : chaque lien ne marche qu'une fois. Demande un nouveau lien (Réglages > Profils sur le téléphone de l'autre personne, ou menu « Le 31 » du Google Sheet)."
-      : E === 'expiree' ? 'Ce lien a expiré (14 jours). Demande-en un nouveau.'
-      : E === 'annulee' ? 'Ce lien a été remplacé par un plus récent : utilise le dernier lien reçu.'
-      : E === 'reseau' ? 'Pas de réseau : réessaie dès que possible.'
-      : E ? 'Lien non reconnu.'
-      : cut ? "L'accès de cet appareil a été coupé. Demande un nouveau lien pour le reconnecter."
-      : "Ouvre le lien d'accès reçu par message pour relier l'appli à vos comptes.";
-    return `<section class="view center">${logo}<h2>${cut ? 'Accès coupé' : E ? 'Lien refusé' : 'Bienvenue'}</h2><p class="hint" style="font-size:14px">${msg}</p>${paste}</section>`;
-  }
-  if (!LOADED) return `<section class="view center">${logo}<p class="hint">${SYNC.state === 'off' ? 'Pas de réseau pour le premier chargement. Réessaie dès que possible.' : 'Chargement des comptes…'}</p>${SYNC.state === 'off' ? '<button class="btn ghost" data-retry="1">Réessayer</button>' : ''}</section>`;
-  if (ME === '') return vOnboard();
-  if (!DB.comptes.length) return `<section class="view center">${logo}<p class="hint">Aucun compte visible pour ce profil. Ajoute un compte perso dans Réglages ou demande à être relié au compte commun.</p></section>`;
-  return null;
+  return (CACHE[ck] = out);
+}
+// objectif du mois : atteint (réel), à venir (réel + prévu), en retard
+function livObj(L, m) {
+  const o = num(L.objectif) || 0; if (!o || !m) return null;
+  return m.realNet >= o - 0.005 ? 'ok' : m.st !== 'real' && m.realNet + m.projNet >= o - 0.005 ? 'wait' : 'late';
 }
 
-function rowEv(e) {
-  const attr = e.kind === 'ponct' || e.kind === 'exc' || e.kind === 'ajust' || e.kind === 'virop' ? `data-oid="${esc(e.id)}"` : e.kind === 'fixe' ? `data-fid="${esc(e.id)}"` : e.kind === 'vir' ? `data-vid="${esc(e.id)}"` : 'disabled';
-  const who = e.who && DB.profils.length > 1 ? ' · ' + esc(pname(e.who)) : '';
-  const tag = e.kind === 'vir' || e.kind === 'virop' ? '<span class="tag">lié</span>' : e.x === 'exc' ? '<span class="tag w">exceptionnel</span>' : e.x === 'int' ? '<span class="tag g">entre mes comptes</span>' : '';
-  return `<button class="item" ${attr}><span class="day">${e.d}</span><span class="lbl"><b>${esc(e.label)}${tag}</b><small>${e.kind === 'ponct' && !e.cat ? 'À classer' : esc(e.cat || '')}${e.kind === 'fixe' ? ' · fixe' : ''}${who}</small></span><span class="amt ${e.v > 0 ? 'pos' : 'neg'}">${sgn(e.v)}</span></button>`;
+/* ================= V3.1 : courbe (accueil et épargne) ================= */
+function lineSvg(pts, label) {
+  const ok = pts.filter(p => p.v !== null && p.v !== undefined); if (!ok.length) return '';
+  const W = 330, H = 180, x0 = 22, x1 = 306, yb = 150, yt = 22;
+  const vs = ok.map(p => p.v), mn = Math.min(0, ...vs), mx = Math.max(1, ...vs);
+  const X = i => pts.length < 2 ? (x0 + x1) / 2 : x0 + i * (x1 - x0) / (pts.length - 1), Y = v => yb - (v - mn) * (yb - yt) / (mx - mn || 1);
+  const seg = (a, b) => `M${X(a.i).toFixed(1)} ${Y(a.v).toFixed(1)} L${X(b.i).toFixed(1)} ${Y(b.v).toFixed(1)}`;
+  const P = pts.map((p, i) => Object.assign({ i }, p)).filter(p => p.v !== null && p.v !== undefined);
+  let solid = '', dash = '';
+  for (let j = 1; j < P.length; j++) { const s = seg(P[j - 1], P[j]); if (P[j].st === 'fut') dash += s + ' '; else solid += s + ' '; }
+  const dots = P.map(p => p.st === 'fut' ? `<circle cx="${X(p.i).toFixed(1)}" cy="${Y(p.v).toFixed(1)}" r="3" fill="var(--surface)" stroke="${p.v < 0 ? 'var(--warn)' : 'var(--accent)'}" stroke-width="2"/>` : `<circle cx="${X(p.i).toFixed(1)}" cy="${Y(p.v).toFixed(1)}" r="${p.st === 'cur' ? 5 : 3.5}" fill="${p.v < 0 ? 'var(--warn)' : 'var(--accent)'}"/>`).join('');
+  const labs = pts.map((p, i) => `<text x="${X(i).toFixed(1)}" y="170" text-anchor="middle">${esc(p.lab)}</text>`).join('');
+  const fmt = v => Math.round(v).toLocaleString('fr-FR');
+  return `<svg class="chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(label)}">
+    <line x1="${x0}" y1="${Y(0).toFixed(1)}" x2="${x1}" y2="${Y(0).toFixed(1)}" class="zero"/>
+    ${solid ? `<path d="${solid}" class="ln"/>` : ''}${dash ? `<path d="${dash}" class="ln dash"/>` : ''}${dots}
+    <g class="lab">${labs}</g><g class="lab"><text x="${W - 2}" y="${(Y(mx) + 3).toFixed(1)}" text-anchor="end">${fmt(mx)}</text><text x="${W - 2}" y="${(Y(0) + 3).toFixed(1)}" text-anchor="end">0</text></g></svg>`;
 }
-
-/* ----- Onglet Mois ----- */
-function vHome() {
-  const acc = UI.acc, A = accOf(acc);
-  if (!started(acc)) return `<section class="view"><div class="hero">
-      <div class="rowhead"><span class="sub">Pour commencer</span></div>
-      <h2>Démarrer : ${esc(A.nom)}</h2>
-      <h3 style="margin:4px 0 0">Importer un relevé <span class="tag">recommandé</span></h3>
-      <p class="hint" style="font-size:14px">Télécharge l'historique du compte sur le site de ta banque (format <b>CSV</b> ou <b>OFX</b>, idéalement 3 mois). Le 31 repère les prélèvements, classe les dépenses et calcule vos habitudes tout de suite.</p>
-      <label class="btn" style="text-align:center">Choisir le fichier<input type="file" id="impFile" accept=".csv,.ofx,.qfx,.txt,text/csv" hidden></label>
-      <div id="impErr"></div>
-    </div>
-    <div class="hero"><h3 style="margin:0">Ou saisir le solde à la main</h3>
-      <p class="hint">Le solde affiché par la banque aujourd'hui. Tu ajouteras ensuite les charges fixes dans l'onglet Charges.</p>
-      <form class="form" id="startForm" novalidate><div class="amountbox"><input id="startBal" inputmode="decimal" placeholder="0,00" aria-label="Solde actuel" autocomplete="off"><span>€</span></div>
-      <button class="btn ghost" type="submit">Démarrer avec ce solde</button></form></div>
-    ${isShared(acc) ? `<div class="note">Compte partagé : une seule personne le démarre, l'autre le retrouvera déjà prêt.</div>` : ''}</section>`;
-  const r = curMonth(acc), seuil = seuilOf(acc);
-  const PS = payState(acc), PC = PS && periodCalc(acc, PS), H = PC || r, st = status(H.end, seuil);
-  const upcoming = r.ev.filter(e => e.d > r.T).sort((a, b) => a.d - b.d);
-  const recent = r.ev.filter(e => e.d <= r.T && ['ponct', 'exc', 'ajust', 'virop'].includes(e.kind)).sort((a, b) => b.d - a.d || String(b.id).localeCompare(String(a.id))).slice(0, 5);
-  const toRecon = r.ev.filter(e => (e.kind === 'fixe' || e.kind === 'vir') && e.d <= r.T && !e.ok).sort((a, b) => a.d - b.d);
-  const fx = r.ev.filter(e => e.kind === 'fixe' || e.kind === 'vir'), fxOut = -fx.filter(e => e.v < 0).reduce((a, e) => a + e.v, 0);
-  const fxDone = fx.filter(e => e.d <= r.T).length;
-  const pSpent = r.cats.reduce((a, c) => a + c.spent, 0), pHab = r.cats.reduce((a, c) => a + c.target, 0);
-  const grp = {}; r.cats.forEach(c => { const t = topOf(c.nom), g = grp[t] = grp[t] || { nom: t, spent: 0, target: 0, budget: 0, n: 0 }; g.spent += c.spent; g.target += c.target; g.budget += num(c.budget) || 0; g.n += c.nom.includes(SEP) ? 1 : 0; });
-  const cats = Object.values(grp).filter(c => c.spent > 0.5 || c.target > 0.5).sort((a, b) => Math.max(b.spent, b.target) - Math.max(a.spent, a.target)).slice(0, 6);
-  const unc = firstUnclosed(acc), frac = r.T / r.D, dv = Math.min(H.D, Math.max(1, UI.dayV || H.T || 1));
-  const dayTxt = PC ? dLabel(PC.dates[dv - 1]) : dv + ' ' + MONTHS[pm(CUR).m];
-  const lowTxt = PC ? dLabel(PC.dates[H.low.d - 1]) : H.low.d + ' ' + MONTHS[pm(CUR).m];
-  return `<section class="view">
-  ${banners(acc)}
-  ${unc ? `<div class="banner warn"><span><b>${mLabel(unc)}</b> n'est pas clôturé.</span><button class="btn small" data-close-month="${unc}">Clôturer</button></div>` : ''}
-  <div class="hero">
-    <div class="rowhead"><span class="sub">${PC ? `Avant la prochaine paie${PS.manual ? ' (date fixée à la main)' : ' · estimée au ' + dLabel(PS.end)}` : `Fin ${MONTHS_L[pm(CUR).m]} prévue`}</span><span class="pill ${st.c}">${st.t}</span></div>
-    <div class="big num">${eur0(H.end)}</div>
-    <div style="font-weight:600;color:var(--${st.c})">${st.msg}</div>
-    ${PC ? `<div class="hint" style="margin-top:-4px">Période en cours : du ${dLabel(PS.start)} au ${dLabel(PS.end)}, d'après ta rentrée « ${esc((DB.fixes.find(f => f.id === PS.fixe) || {}).libelle || '')} ». Modifiable dans Réglages.</div>` : ''}
-    <div class="kv">
-      <div><small>Solde estimé au ${TODAY} ${MONTHS[pm(CUR).m]}</small><b>${eur(H.bal)}</b></div>
-      <div><small>D'ici le ${PC ? dLabel(PS.end) : r.D}</small><b>${sgn(r2(H.end - H.bal))}</b></div>
-    </div>
-    ${curveSVG(H, seuil, dv)}
-    <label class="daysim" for="dayV"><span>Le <b class="num">${dayTxt}</b></span><input type="range" id="dayV" min="1" max="${H.D}" value="${dv}" aria-label="Jour"><b class="num" style="color:var(--${H.curve[dv - 1] < 0 ? 'bad' : 'ink'})">${eur0(H.curve[dv - 1])}</b></label>
-    <div class="hint" style="margin-top:-8px">${dv < H.T ? 'Solde réel ce jour-là (opérations connues).' : dv === H.T ? 'Solde estimé aujourd\'hui.' : `Solde prévu ce jour-là : charges fixes à leur date${UI.hab ? ', ponctuel habituel réparti sur les jours' : ''}.`} Fais glisser pour voir un autre jour.</div>
-    <label class="switch" for="habOn" style="gap:10px"><span style="font-size:14px">Prévoir le ponctuel d'après nos habitudes<small class="mini" style="display:block">${UI.hab ? `Reste estimé : ${eur0(r.varRem)} de dépenses${r.incRem > 0.5 ? `, ${eur0(r.incRem)} de rentrées` : ''}` : 'Coupé : seulement les charges fixes et les opérations connues'}</small></span><input type="checkbox" id="habOn" ${UI.hab ? 'checked' : ''}></label>
-    ${H.low.v < 0 ? `<div class="alert bad">Découvert prévu le ${lowTxt} : ${eur0(H.low.v)}</div>` : ''}
-    <div class="actions"><button class="btn ghost small" data-fixbal="1">Corriger le solde</button><label class="btn ghost small" style="text-align:center;flex:1">Importer un relevé<input type="file" id="impFile" accept=".csv,.ofx,.qfx,.txt,text/csv" hidden></label></div>
-    <div id="impErr"></div>
-  </div>
-  <div class="tiles">
-    <button class="tile" data-go="fixed"><small>Fixes ${deMois(CUR)}</small><b>${fxOut ? '−' + eur0(fxOut) : eur0(0)}</b><span>${fxDone} passé${fxDone > 1 ? 's' : ''} · ${fx.length - fxDone} à venir</span></button>
-    <button class="tile" data-go="ponct"><small>Ponctuel ${deMois(CUR)}</small><b>${pSpent ? '−' + eur0(pSpent) : eur0(0)}</b><span>${pHab ? `habitude ${eur0(pHab)} / mois` : 'dépenses hors fixes'}</span></button>
-  </div>
-  ${toRecon.length ? `<div class="block"><div class="rowhead"><h2>À pointer sur le relevé</h2><span class="sub">${toRecon.length} en attente</span></div>
-    <div class="list">${toRecon.map(e => `<div class="recon"><span class="day" style="font-family:var(--f-mono);font-size:12px;text-align:center;background:var(--sunk);border-radius:8px;padding:5px 0;color:var(--muted)">${e.d}</span><span class="lbl"><b>${esc(e.label)}</b><small>prévu ${eur(Math.abs(e.v))} · pas encore vu</small></span><input id="rc-${esc(e.key)}" inputmode="decimal" value="${fr(r2(Math.abs(e.v)))}" aria-label="Montant réel"><button class="chk" data-recon="${esc(e.key)}" aria-label="Pointer">✓</button></div>`).join('')}</div>
-    <div class="hint">Date passée mais pas encore vu sur le compte : compté dans la fin de mois, pas dans le solde du jour. Pointe-le quand il passe (corrige le montant si besoin) ; importer le relevé les pointe tout seul.</div>
-  </div>` : ''}
-  ${cats.length ? `<div class="block"><div class="rowhead"><h2>Ponctuel : où part l'argent</h2><button class="btn ghost small" data-go="ponct">Détail</button></div>
-    <div class="list">${cats.map(c => { const p = c.target ? c.spent / c.target : (c.spent ? 2 : 0), cl = p > 1 ? 'over' : p > frac + .15 ? 'near' : '';
-      return `<button class="catbar" data-pcat="${esc(c.nom)}"><div class="t"><b>${esc(catLabel(c.nom))}${c.n ? '<small class="mini"> · détail</small>' : ''}</b><span>${eur0(c.spent)} / ${eur0(c.target)}${c.budget ? ' budget' : ''}</span></div><div class="bar"><i class="${cl}" style="width:${Math.min(100, p * 100)}%"></i><em style="left:${frac * 100}%"></em></div></button>`; }).join('')}</div>
-    <div class="hint">Dépensé ce mois-ci / habitude (ou budget s'il y en a un). Le trait : où vous devriez en être au ${TODAY}. Hors fixes et hors mouvements exceptionnels.</div></div>` : ''}
-  <div class="block"><div class="rowhead"><h2>À venir d'ici le ${r.D}</h2><span class="sub">${upcoming.length} opération${upcoming.length > 1 ? 's' : ''}</span></div>
-    <div class="list">${upcoming.length ? upcoming.map(rowEv).join('') : `<div class="empty">Plus rien de prévu ce mois-ci.</div>`}
-    ${r.varRem > 0.5 ? `<div class="item" disabled><span class="day">~</span><span class="lbl"><b>Reste du ponctuel</b><small>estimé d'après les habitudes, réparti sur les jours restants</small></span><span class="amt neg">${sgn(-r.varRem)}</span></div>` : ''}
-    ${r.incRem > 0.5 ? `<div class="item" disabled><span class="day">~</span><span class="lbl"><b>Rentrées habituelles</b><small>remboursements, aides… estimées</small></span><span class="amt pos">${sgn(r.incRem)}</span></div>` : ''}</div>
-  </div>
-  <div class="block"><div class="rowhead"><h2>Dernières opérations</h2><button class="btn ghost small" data-go="ponct">Tout voir</button></div>
-    <div class="list">${recent.length ? recent.map(rowEv).join('') : `<div class="empty">Aucune opération ce mois-ci.</div>`}</div>
-  </div></section>`;
-}
-
-// Bandeaux : serveur à mettre à jour, doublons virement lié / rentrée fixe, compte importé avant la V1.4
-function banners(acc) {
-  let h = bankBanners(acc);
-  if (SYNC.v && SYNC.v < '1.4') h += `<div class="banner warn"><span>Serveur en V${esc(SYNC.v)} : mets à jour <b>Code.gs</b> (Apps Script, nouvelle version) pour garder les noms et catégories appris.</span></div>`;
-  DB.virements.filter(v => v.vers === acc && bool(v.actif)).forEach(v => { const f = dupFixeFor(v); if (f) h += `<div class="banner warn"><span>« <b>${esc(f.libelle)}</b> » fait doublon avec le virement lié « ${esc(v.libelle)} » : compté deux fois.</span><button class="btn small" data-dupfix="${esc(f.id)}" data-dupvir="${esc(v.id)}">Corriger</button></div>`; });
-  if (DB.operations.some(o => o.compte === acc && o.ref) && !param('imp14|' + acc, '') && !store.get('le31-noreimp|' + acc, false))
-    h += `<div class="banner"><span style="display:flex;flex-direction:column;gap:8px">Ce compte a été importé avec une ancienne version. <span><b>Refais l'import</b> avec le même relevé et choisis « Tout refaire » : charges fixes, noms et prévisions seront justes.</span><span class="actions"><label class="btn small" style="text-align:center">Choisir le relevé<input type="file" id="impFile" accept=".csv,.ofx,.qfx,.txt,text/csv" hidden></label><button class="btn ghost small" data-noreimp="${esc(acc)}">Plus tard</button></span></span></div>`;
-  const PS = payState(acc);
-  if (PS) {
-    const vuKey = 'le31-payeVu|' + acc, vu = store.get(vuKey, '');
-    if (vu && vu !== PS.start) { store.set(vuKey, PS.start); h += `<div class="banner"><span>Nouvelle paie détectée le <b>${dLabel(PS.start)}</b> : la période affichée va maintenant jusqu'au ${dLabel(PS.end)} environ. Rien n'est compté en double : c'est seulement la fenêtre affichée qui avance avec la paie.</span></div>`; }
-    else if (!vu) store.set(vuKey, PS.start);
-  }
-  return h;
-}
-
-/* ----- Onglet Ponctuel : toutes les opérations, mois par mois ----- */
-const P = { k: null, q: '', f: 'tout', cat: '', view: store.get('le31-pview', 'ponct') };
-function vPonct() {
-  const acc = UI.acc;
-  if (!started(acc)) return `<section class="view"><div class="note">Démarre d'abord le compte dans l'onglet Mois (import d'un relevé ou solde à la main).</div></section>`;
-  const vseg = `<div class="seg" role="group" aria-label="Vue"><button data-pview="ponct" aria-pressed="${P.view !== 'releve'}">Ponctuel</button><button data-pview="releve" aria-pressed="${P.view === 'releve'}">Relevé complet</button></div>`;
-  if (P.view === 'releve') return vReleve(vseg);
-  const k0 = startMonth(acc), lastOp = DB.operations.filter(o => o.compte === acc).reduce((m, o) => String(o.date).slice(0, 7) > m ? String(o.date).slice(0, 7) : m, CUR);
-  if (!P.k || P.k < k0) P.k = CUR;
-  const q = NORM(P.q.trim()), all = DB.operations.filter(o => o.compte === acc);
-  const base = q ? all.filter(o => NORM(nameOf(o) + ' ' + o.libelle + ' ' + (o.categorie || '')).includes(q)) : all.filter(o => String(o.date).slice(0, 7) === P.k);
-  const F = { tout: o => true, nc: o => isPonct(o) && !o.categorie, exc: o => o.type === 'exc' || o.type === 'int', in: o => (num(o.montant) || 0) > 0 && isPonct(o), cat: o => (P.cat ? inCat(o.categorie, P.cat) : !o.categorie) && isPonct(o) };
-  const list = base.filter(F[P.f] || F.tout).sort((a, b) => String(b.date).localeCompare(String(a.date)) || String(b.id).localeCompare(String(a.id)));
-  const ncAll = all.filter(F.nc).length;
-  const r = calc(acc, P.k, startOf(acc, P.k)), spent = r.cats.reduce((a, c) => a + c.spent, 0), hab = catList(acc).reduce((a, c) => a + habit(acc, c.nom), 0);
-  const inc = incomeMonth(acc, P.k), ratio = hab ? spent / (hab * (P.k === CUR ? Math.max(.2, TODAY / dim(CUR)) : 1)) : 0;
-  const pill = !hab ? '' : ratio > 1.1 ? '<span class="pill bad">au-dessus</span>' : ratio > .95 ? '<span class="pill warn">dans la moyenne</span>' : '<span class="pill good">sous l\'habitude</span>';
-  const groups = {}; list.slice(0, 300).forEach(o => { const g = q ? String(o.date).slice(0, 7) : String(o.date); (groups[g] = groups[g] || []).push(o); });
-  const head = g => q ? mLabel(g) : (+g.slice(8, 10)) + ' ' + MONTHS_L[pm(g.slice(0, 7)).m];
-  const row = o => { const v = num(o.montant) || 0, tg = o.type === 'exc' ? '<span class="tag w">exceptionnel</span>' : o.type === 'int' ? '<span class="tag g">entre mes comptes</span>' : o.type === 'vir' ? '<span class="tag">lié</span>' : '';
-    return `<button class="item" data-oid="${esc(o.id)}" style="grid-template-columns:1fr auto"><span class="lbl"><b>${esc(nameOf(o))}${tg}</b><small>${o.type === 'ajust' ? 'Correction de solde' : o.categorie ? catHtml(o.categorie) : '<span style="color:var(--warn);font-weight:700">À classer</span>'}${q ? ' · ' + (+String(o.date).slice(8, 10)) + ' ' + MONTHS[pm(String(o.date).slice(0, 7)).m] + ' ' + String(o.date).slice(2, 4) : ''}${o.profil && DB.profils.length > 1 && o.profil !== ME ? ' · ' + esc(pname(o.profil)) : ''}</small></span><span class="amt ${v > 0 ? 'pos' : 'neg'}">${sgn(v)}</span></button>`; };
-  return `<section class="view">${vseg}
-    ${q ? `<div class="rowhead"><h2>${list.length} résultat${list.length > 1 ? 's' : ''}</h2><span class="sub">tous les mois</span></div>` : `<div class="mnav"><button data-pm="-1" aria-label="Mois précédent" ${P.k <= k0 ? 'disabled' : ''}>‹</button><b>${mLabel(P.k)}</b><button data-pm="1" aria-label="Mois suivant" ${P.k >= lastOp ? 'disabled' : ''}>›</button></div>
-    <div class="hero" style="gap:8px"><div class="rowhead"><span class="sub">Dépenses ponctuelles${P.k === CUR ? ' à ce jour' : ''}</span>${P.k <= CUR ? pill : ''}</div>
-      <div class="big num" style="font-size:34px">${eur0(spent)}</div>
-      <div class="hint" style="font-size:13px">Habitude : ${eur0(hab)} par mois${inc > 0.5 ? ` · rentrées ponctuelles : ${eur0(inc)}` : ''}. Hors charges fixes, hors exceptionnel et virements entre tes comptes.</div></div>`}
-    <div class="search"><input id="pQ" type="search" placeholder="Rechercher (Amazon, resto…)" value="${esc(P.q)}" aria-label="Rechercher" autocomplete="off" enterkeyhint="search"></div>
-    <div class="chips">${[['tout', 'Tout'], ['nc', 'À classer' + (ncAll ? ' · ' + ncAll : '')], ['exc', 'Exceptionnels'], ['in', 'Rentrées']].concat(P.f === 'cat' ? [['cat', catLabel(P.cat)]] : []).map(([k, l]) => `<button class="chip" data-pf="${k}" aria-pressed="${P.f === k}">${esc(l)}</button>`).join('')}</div>
-    ${P.f === 'nc' && !q && ncAll > list.length ? `<div class="hint">${ncAll} opération(s) à classer en tout, sur plusieurs mois : tape une lettre dans la recherche pour les voir toutes, ou change de mois.</div>` : ''}
-    ${Object.keys(groups).length ? Object.keys(groups).sort().reverse().map(g => `<div class="dayhead">${head(g)}</div><div class="list">${groups[g].map(row).join('')}</div>`).join('') : `<div class="empty">Aucune opération${q ? ' trouvée' : ' ce mois-ci'}.</div>`}
-    ${list.length > 300 ? '<div class="hint">300 premières affichées : précise la recherche.</div>' : ''}
-    <div class="hint">Touche une opération pour la renommer, la classer (avec toutes celles du même marchand), ou la marquer exceptionnelle.</div>
-  </section>`;
-}
-
-
-/* ----- Relevé complet : toutes les entrées et sorties du mois, comme sur le relevé de la banque, avec le solde après chaque ligne ----- */
-function vReleve(vseg) {
-  const acc = UI.acc, k0 = startMonth(acc);
-  if (!P.k || P.k < k0) P.k = CUR;
-  const k = P.k, start = startOf(acc, k), r = calc(acc, k, start);
-  const passed = r.ev.filter(e => e.kind !== 'sim' && !e.late && e.d <= (k < CUR ? r.D : k === CUR ? r.T : 0)), todo = r.ev.filter(e => e.kind !== 'sim' && !passed.includes(e));
-  const ord = (a, b) => a.d - b.d || (b.v > 0) - (a.v > 0);
-  let s = start; const rows = passed.slice().sort(ord).map(e => { s += e.v; return { e, s }; });
-  const inn = passed.filter(e => e.v > 0).reduce((x, e) => x + e.v, 0), out = -passed.filter(e => e.v < 0).reduce((x, e) => x + e.v, 0);
-  const bk = bkRow(acc), bkS = bk && bk.solde !== '' ? num(bk.solde) : null, gap = bkS !== null && k === CUR ? r2(r.bal - bkS) : null;
-  // doublons possibles : même jour, même montant
-  const seen = {}; passed.forEach(e => { const kk = e.d + '|' + r2(e.v); seen[kk] = (seen[kk] || 0) + 1; });
-  const line = (e, sAfter, fut) => {
-    const attr = e.kind === 'fixe' ? `data-fid="${esc(e.id)}"` : e.kind === 'vir' ? `data-vid="${esc(e.id)}"` : `data-oid="${esc(e.id)}"`;
-    const tag = e.kind === 'fixe' ? `<span class="tag ${e.ok ? 'ok' : ''}">fixe${e.ok ? ' ✓' : ''}</span>` : e.kind === 'vir' || e.kind === 'virop' ? '<span class="tag">lié</span>' : e.kind === 'ajust' ? '<span class="tag w">correction</span>' : e.x === 'exc' ? '<span class="tag w">exceptionnel</span>' : e.x === 'int' ? '<span class="tag g">entre mes comptes</span>' : '';
-    const dbl = !fut && seen[e.d + '|' + r2(e.v)] > 1 ? '<span class="tag w">même jour, même montant</span>' : '';
-    const sub = fut ? (e.late ? 'date passée, pas encore vue sur le compte' : 'prévu') : e.kind === 'ajust' ? 'écart corrigé pour coller au solde réel' : e.kind === 'fixe' || e.kind === 'vir' ? (e.ok ? 'vu sur le compte' : 'prévu, pas pointé') : (e.cat ? esc(e.cat) : 'À classer');
-    return `<button class="item rl2" ${attr} style="grid-template-columns:34px 1fr auto"><span class="day">${e.d}</span><span class="lbl"><b>${esc(e.label || '')}${tag}${dbl}</b><small>${sub}</small></span><span class="amt ${e.v > 0 ? 'pos' : 'neg'}">${sgn(e.v)}${sAfter != null ? `<small>solde ${eur(r2(sAfter))}</small>` : ''}</span></button>`;
-  };
-  return `<section class="view">${vseg}
-    <div class="mnav"><button data-pm="-1" aria-label="Mois précédent" ${k <= k0 ? 'disabled' : ''}>‹</button><b>${mLabel(k)}</b><button data-pm="1" aria-label="Mois suivant" ${k >= CUR ? 'disabled' : ''}>›</button></div>
-    <div class="hero" style="gap:10px">
-      <div class="kv"><div><small>Solde au 1er</small><b>${eur(r2(start))}</b></div><div><small>${k === CUR ? 'Solde aujourd\'hui' : 'Solde fin de mois'}</small><b>${eur(r2(s))}</b></div></div>
-      <div class="kv"><div><small>Entrées</small><b class="pos">+${eur(r2(inn))}</b></div><div><small>Sorties</small><b>−${eur(r2(out))}</b></div></div>
-      ${gap !== null ? (Math.abs(gap) >= 1 ? `<div class="note warn"><b>Écart avec la banque : ${sgn(gap)}</b> (banque : ${eur(bkS)}, lu ${esc(bkTime(acc))}). Cherche une ligne en double ou en trop ci-dessous (repère « même jour, même montant » ou « correction ») : touche-la pour la corriger ou la supprimer.</div>` : `<div class="note good">Identique au solde de la banque (${eur(bkS)}, lu ${esc(bkTime(acc))}).</div>`) : ''}
-    </div>
-    ${todo.length ? `<div class="dayhead">À venir d'ici le ${r.D}</div><div class="list">${todo.slice().sort(ord).map(e => line(e, null, true)).join('')}</div>` : ''}
-    <div class="dayhead">Passé · du plus récent au plus ancien</div>
-    <div class="list">${rows.length ? rows.slice().reverse().map(x => line(x.e, x.s)).join('') : '<div class="empty">Aucun mouvement ce mois-ci.</div>'}</div>
-    <div class="hint">Toutes les lignes du mois : charges fixes (✓ = vues sur le compte), virements liés, dépenses et rentrées ponctuelles, corrections de solde. Le solde après chaque ligne se compare au relevé de la banque.</div>
-  </section>`;
-}
-
-/* ----- Onglet Bilan : évolution mois par mois des thèmes choisis ----- */
-const BIL = { n: store.get('le31-bil-n', 12), mode: store.get('le31-bil-mode', 'barres'), exc: false, sel: null, table: false };
-const BTHEMES = { __ponct: 'Tout le ponctuel', __fixes: 'Toutes les charges fixes' };
-const bLabel = c => BTHEMES[c] || catLabel(leafOf(c));
-// remplacer une catégorie principale par toutes ses sous-catégories
-function bilDetail(acc, P) {
-  const S = bilSel(acc), kids = catsOf(acc).map(c => c.nom).filter(n => n.startsWith(P + SEP));
-  S.cats = S.cats.filter(c => c !== P); delete S.col[P];
-  kids.forEach(k => { if (S.cats.length < 8 && !S.cats.includes(k)) { const u = new Set(Object.values(S.col)); let s = 1; while (u.has(s)) s++; S.cats.push(k); S.col[k] = s; } });
-  store.set('le31-bil|' + acc, S); render();
-}
-function bilSel(acc) {
-  const s = store.get('le31-bil|' + acc, null);
-  if (s && s.cats) return s;
-  // par défaut : les 3 catégories où part le plus d'argent
-  const tot = {}; DB.operations.filter(o => o.compte === acc && isPonct(o) && o.categorie && (num(o.montant) || 0) < 0).forEach(o => tot[o.categorie] = (tot[o.categorie] || 0) - num(o.montant));
-  const cats = Object.entries(tot).filter(([c]) => !isIncomeCat(c)).sort((a, b) => b[1] - a[1]).slice(0, 3).map(x => x[0]);
-  const col = {}; cats.forEach((c, i) => col[c] = i + 1);
-  return { cats, col };
-}
-// montant d'un thème sur un mois (dépenses en positif ; pour une catégorie de rentrées, les rentrées)
-function bilVal(acc, k, c) {
-  const ev = events(acc, k), T = k < CUR ? 99 : k === CUR ? TODAY : 0;
-  const okOp = o => isPonct(o) || (BIL.exc && (o.type === 'exc'));
-  if (c === '__ponct') return Math.max(0, -opsOf(acc, k).filter(o => okOp(o) && !isIncomeCat(o.categorie) && (o.categorie || (num(o.montant) || 0) < 0)).reduce((a, o) => a + (num(o.montant) || 0), 0));
-  const fx = e => (e.kind === 'fixe' || e.kind === 'vir') && (e.ok || e.d <= T);
-  if (c === '__fixes') return -ev.filter(e => fx(e) && e.v < 0).reduce((a, e) => a + e.v, 0);
-  const mine = x => c ? inCat(x, c) : !x; // une catégorie principale comprend ses sous-catégories
-  const ops = opsOf(acc, k).filter(o => okOp(o) && mine(o.categorie)).reduce((a, o) => a + (num(o.montant) || 0), 0);
-  const fix = ev.filter(e => fx(e) && e.kind === 'fixe' && mine(e.cat === 'Autre' ? '' : e.cat)).reduce((a, e) => a + e.v, 0);
-  const net = ops + fix;
-  return isIncomeCat(c) ? Math.max(0, net) : Math.max(0, -net);
-}
-function vBilan() {
-  const acc = UI.acc;
-  if (!started(acc)) return `<section class="view"><div class="note">Démarre d'abord le compte dans l'onglet Mois (import d'un relevé ou solde à la main).</div></section>`;
-  const S = bilSel(acc), k0 = startMonth(acc), n = BIL.n === 0 ? diffM(k0, CUR) + 1 : Math.min(BIL.n, diffM(k0, CUR) + 1);
-  const months = Array.from({ length: n }, (_, i) => addM(CUR, i - n + 1));
-  const used = new Set(DB.operations.filter(o => o.compte === acc && (isPonct(o) || o.type === 'exc')).map(o => o.categorie || ''));
-  DB.fixes.filter(f => f.compte === acc).forEach(f => used.add(f.categorie || ''));
-  [...used].forEach(c => { if (c.includes(SEP)) used.add(topOf(c)); });
-  const cats = catsOf(acc).map(c => c.nom).filter(c => used.has(c)).concat([...used].filter(c => c && !catsOf(acc).some(x => x.nom === c) && !['Virement', 'Correction de solde'].includes(c))).concat(used.has('') ? [''] : []);
-  const themes = ['__ponct', '__fixes'].concat(cats), sel = S.cats.filter(c => themes.includes(c));
-  const data = sel.map(c => ({ c, v: months.map(k => bilVal(acc, k, c)) }));
-  // « Tout le ponctuel » contient déjà les catégories : on ne les additionne pas (barres côte à côte, pas de total)
-  const fixCats = new Set(DB.fixes.filter(f => f.compte === acc).map(f => f.categorie || ''));
-  const overlap = (sel.includes('__ponct') && sel.some(c => !BTHEMES[c])) || (sel.includes('__fixes') && sel.some(c => !BTHEMES[c] && [...fixCats].some(f => inCat(f, c))))
-    || sel.some(c => !BTHEMES[c] && sel.some(d => d !== c && !BTHEMES[d] && inCat(d, c)));
-  BIL.overlap = overlap;
-  data.forEach(d => { const f = months.map((k, i) => i).filter(i => months[i] < CUR); d.avg = f.length ? f.reduce((x, i) => x + d.v[i], 0) / f.length : 0; });
-  const tot = months.map((k, i) => data.reduce((a, d) => a + d.v[i], 0));
-  const full = months.map((k, i) => i).filter(i => months[i] < CUR), avg = full.length ? full.reduce((a, i) => a + tot[i], 0) / full.length : 0;
-  const l3 = full.slice(-3), p3 = full.slice(-6, -3), m3 = l3.length ? l3.reduce((a, i) => a + tot[i], 0) / l3.length : 0, mp = p3.length ? p3.reduce((a, i) => a + tot[i], 0) / p3.length : 0;
-  const trend = p3.length && mp > 0 ? (m3 - mp) / mp : null;
-  const hasKids = c => !BTHEMES[c] && cats.some(x => x.startsWith(c + SEP));
-  const chip = c => { const on = sel.includes(c), kid = c.includes(SEP); return `<button class="chip bchip ${kid ? 'kid' : ''}" data-bcat="${esc(c)}" aria-pressed="${on}">${on ? `<i style="background:var(--s${S.col[c] || 1})"></i>` : ''}${kid ? '↳ ' + esc(leafOf(c)) : esc(bLabel(c)) + (hasKids(c) ? ' (tout)' : '')}</button>${hasKids(c) && on ? `<button class="chip bdet" data-bdet="${esc(c)}">Détailler ${esc(c)}</button>` : ''}`; };
-  const selM = BIL.sel && months.includes(BIL.sel) ? BIL.sel : null;
-  return `<section class="view">
-    <div class="rowhead"><h2>Bilan</h2><span class="sub">${esc(accName(acc))}</span></div>
-    <div class="block" style="gap:8px"><div class="mini">Thèmes à suivre (8 au plus) :</div>
-      <div class="chips">${themes.map(chip).join('')}</div></div>
-    <div class="bctl"><div class="seg" style="grid-template-columns:1fr 1fr 1fr" role="group" aria-label="Période">${[[6, '6 mois'], [12, '12 mois'], [0, 'Tout']].map(([v, l]) => `<button data-bn="${v}" aria-pressed="${BIL.n === v}">${l}</button>`).join('')}</div>
-      <div class="seg" role="group" aria-label="Graphique">${[['barres', 'Barres'], ['courbes', 'Courbes']].map(([v, l]) => `<button data-bmode="${v}" aria-pressed="${BIL.mode === v}">${l}</button>`).join('')}</div></div>
-    ${!sel.length ? `<div class="note">Choisis un ou plusieurs thèmes ci-dessus : par exemple <b>Abonnements</b>, <b>Courses</b> et <b>Carburant</b>, ou <b>Tout le ponctuel</b>.</div>` : `
-    <div class="hero" style="gap:12px">
-      ${overlap ? '<div class="hint">« Tout le ponctuel » comprend déjà les catégories choisies : les barres sont côte à côte, sans total.</div>' : `<div class="kv"><div><small>Moyenne / mois${full.length < months.length ? ' (mois complets)' : ''}</small><b>${eur0(avg)}</b></div><div><small>${trend === null ? 'Total sur la période' : '3 derniers mois / 3 précédents'}</small><b style="color:var(--${trend === null ? 'ink' : trend > 0.05 ? 'bad' : trend < -0.05 ? 'good' : 'ink'})">${trend === null ? eur0(tot.reduce((a, b) => a + b, 0)) : (trend > 0 ? '+' : '') + Math.round(trend * 100) + ' %'}</b></div></div>`}
-      ${bilChart(months, data, S, selM)}
-      <div class="legend">${data.map(d => `<span><i style="background:var(--s${S.col[d.c] || 1})"></i>${esc(bLabel(d.c))} · <b class="num" style="color:var(--ink)">${eur0(d.avg)}</b>/mois</span>`).join('')}</div>
-      ${selM ? (() => { const i = months.indexOf(selM); return `<div class="note" style="display:flex;flex-direction:column;gap:4px"><b>${mLabel(selM)}${selM === CUR ? ' (en cours)' : ''}</b>${data.map(d => `<span style="display:flex;justify-content:space-between;gap:8px"><span>${esc(bLabel(d.c))}</span><b class="num">${eur(r2(d.v[i]))}</b></span>`).join('')}${data.length > 1 && !overlap ? `<span style="display:flex;justify-content:space-between;border-top:1px solid var(--line);padding-top:4px"><span>Total</span><b class="num">${eur(r2(tot[i]))}</b></span>` : ''}</div>`; })() : '<div class="hint">Touche un mois sur le graphique pour voir le détail. Le mois en cours est plus clair : il n\'est pas fini.</div>'}
-    </div>
-    <label class="switch" for="bExc"><span style="font-size:14px">Inclure les dépenses exceptionnelles</span><input type="checkbox" id="bExc" ${BIL.exc ? 'checked' : ''}></label>
-    <div class="block"><div class="rowhead"><h2>Mois par mois</h2></div>
-      <div class="tablewrap"><table><thead><tr><th>Mois</th>${data.map(d => `<th>${esc(bLabel(d.c))}</th>`).join('')}${data.length > 1 && !overlap ? '<th>Total</th>' : ''}</tr></thead><tbody>
-      ${months.slice().reverse().map(k => { const i = months.indexOf(k); return `<tr><td>${mShort(k)} ${String(pm(k).y).slice(2)}${k === CUR ? ' · en cours' : ''}</td>${data.map(d => `<td>${eur0(d.v[i])}</td>`).join('')}${data.length > 1 && !overlap ? `<td class="end">${eur0(tot[i])}</td>` : ''}</tr>`; }).join('')}
-      </tbody></table></div>
-      <div class="hint">Charges fixes comprises dans chaque catégorie (ex. Netflix dans Abonnements). Remboursements déduits. Les virements entre tes comptes ne comptent pas.</div></div>`}
-  </section>`;
-}
-function bilChart(months, data, S, selM) {
-  const W = 340, H = 190, L = 40, R = 6, Tp = 10, B = 24, n = months.length;
-  const stack = BIL.mode === 'barres' && !BIL.overlap, group = BIL.mode === 'barres' && BIL.overlap;
-  const mxv = Math.max(1, ...months.map((k, i) => stack ? data.reduce((a, d) => a + d.v[i], 0) : Math.max(...data.map(d => d.v[i]))));
-  const step = niceStep(mxv / 4), top = Math.ceil(mxv / step) * step;
-  const bw = (W - L - R) / n, x = i => L + i * bw, y = v => Tp + (top - v) * (H - Tp - B) / top;
-  let g = '';
-  for (let t = 0; t <= top + 0.1; t += step) g += `<line x1="${L}" x2="${W - R}" y1="${y(t)}" y2="${y(t)}" stroke="var(--line)" stroke-width="1"/><text x="${L - 5}" y="${y(t) + 3.5}" text-anchor="end" font-size="9.5" fill="var(--muted)">${t >= 1000 ? (t / 1000).toLocaleString('fr-FR') + ' k' : Math.round(t)}</text>`;
-  const lab = Math.ceil(n / 7);
-  months.forEach((k, i) => { if ((n - 1 - i) % lab === 0) g += `<text x="${x(i) + bw / 2}" y="${H - 8}" text-anchor="middle" font-size="9.5" fill="var(--muted)">${mShort(k).replace('.', '')}${pm(k).m === 0 ? ' ' + String(pm(k).y).slice(2) : ''}</text>`; });
-  if (group) {
-    const gw = Math.min(bw * 0.8, 10 * data.length + 8), w = Math.max(2, gw / data.length - 2);
-    months.forEach((k, i) => data.forEach((d, j) => { const v = d.v[i]; if (v <= 0.5) return; const cx = x(i) + (bw - gw) / 2 + j * (w + 2), y1 = y(v), h = Math.max(1, y(0) - y1), rr = Math.min(3, w / 2, h);
-      g += `<path d="M${cx},${y(0)} V${y1 + rr} q0,-${rr} ${rr},-${rr} H${cx + w - rr} q${rr},0 ${rr},${rr} V${y(0)} Z" fill="var(--s${S.col[d.c] || 1})" opacity="${k === CUR ? .45 : 1}"/>`; }));
-  } else if (stack) {
-    const w = Math.max(3, Math.min(26, bw * 0.62));
-    months.forEach((k, i) => {
-      let base = 0; const cx = x(i) + (bw - w) / 2, cur = k === CUR;
-      data.forEach((d, j) => { const v = d.v[i]; if (v <= 0.5) return; const y1 = y(base + v), y0 = y(base), last = data.slice(j + 1).every(e => e.v[i] <= 0.5);
-        const h = Math.max(1, y0 - y1 - (base > 0 ? 2 : 0));
-        g += last ? `<path d="M${cx},${y0 - (base > 0 ? 2 : 0)} V${y1 + Math.min(4, h / 2)} q0,-${Math.min(4, h / 2)} ${Math.min(4, w / 2)},-${Math.min(4, h / 2)} H${cx + w - Math.min(4, w / 2)} q${Math.min(4, w / 2)},0 ${Math.min(4, w / 2)},${Math.min(4, h / 2)} V${y0 - (base > 0 ? 2 : 0)} Z" fill="var(--s${S.col[d.c] || 1})" opacity="${cur ? .45 : 1}"/>`
-          : `<rect x="${cx}" y="${y1}" width="${w}" height="${h}" fill="var(--s${S.col[d.c] || 1})" opacity="${cur ? .45 : 1}"/>`;
-        base += v; });
-    });
-  } else {
-    data.forEach(d => {
-      const pts = d.v.map((v, i) => [x(i) + bw / 2, y(v)]), col = `var(--s${S.col[d.c] || 1})`, done = pts.slice(0, months[n - 1] === CUR ? n - 1 : n);
-      g += `<polyline points="${done.map(p => p.join(',')).join(' ')}" fill="none" stroke="${col}" stroke-width="2" stroke-linejoin="round"/>`;
-      if (months[n - 1] === CUR && n > 1) g += `<polyline points="${pts.slice(n - 2).map(p => p.join(',')).join(' ')}" fill="none" stroke="${col}" stroke-width="2" stroke-dasharray="4 3"/>`;
-      if (n <= 13) pts.forEach(p => g += `<circle cx="${p[0]}" cy="${p[1]}" r="3.2" fill="${col}" stroke="var(--surface)" stroke-width="1.5"/>`);
-    });
-  }
-  if (selM) { const i = months.indexOf(selM); g = `<rect x="${x(i)}" y="${Tp}" width="${bw}" height="${H - Tp - B}" fill="var(--accent-soft)" rx="4"/>` + g; }
-  g += `<line x1="${L}" x2="${W - R}" y1="${y(0)}" y2="${y(0)}" stroke="var(--muted)" stroke-width="1"/>`;
-  months.forEach((k, i) => g += `<rect x="${x(i)}" y="0" width="${bw}" height="${H}" fill="transparent" data-bm="${k}" style="cursor:pointer"><title>${mLabel(k)}</title></rect>`);
-  return `<svg class="curve" viewBox="0 0 ${W} ${H}" role="img" aria-label="Évolution mois par mois">${g}</svg>`;
-}
-function bilToggle(acc, c) {
-  const S = bilSel(acc);
-  if (S.cats.includes(c)) { S.cats = S.cats.filter(x => x !== c); delete S.col[c]; }
-  else { if (S.cats.length >= 8) { toast('8 thèmes au plus : retires-en un'); return; } const usedC = new Set(Object.values(S.col)); let s = 1; while (usedC.has(s)) s++; S.cats.push(c); S.col[c] = s; }
-  store.set('le31-bil|' + acc, S); render();
-}
-
-/* ----- Onglet Charges ----- */
-function vFixed() {
-  const acc = UI.acc, A = accOf(acc), sortd = a => a.slice().sort((x, y) => (num(x.jour) || 0) - (num(y.jour) || 0));
-  const per = f => { const a = num(f.montant) || 0; return f.frequence === 'T' ? a / 3 : f.frequence === 'A' ? a / 12 : a; };
-  const fx = DB.fixes.filter(f => f.compte === acc);
-  const live = f => bool(f.actif) && (!f.fin || f.fin >= CUR);
-  const vr = DB.virements.filter(v => v.de === acc || v.vers === acc);
-  const vrIn = v => v.vers === acc;
-  const tot = fx.filter(f => live(f) && f.sens !== '+').reduce((a, f) => a + per(f), 0) + vr.filter(v => bool(v.actif) && !vrIn(v)).reduce((a, v) => a + (num(v.montant) || 0), 0);
-  const totR = fx.filter(f => live(f) && f.sens === '+').reduce((a, f) => a + per(f), 0) + vr.filter(v => bool(v.actif) && vrIn(v)).reduce((a, v) => a + (num(v.montant) || 0), 0);
-  const stateTxt = (cle, day, occ, active) => !active ? ' · en pause' : point(CUR, cle) ? ' · pointé ✓' : occ && day <= TODAY ? ' · à pointer' : occ ? ' · à venir' : '';
-  const row = f => {
-    const occ = occursF(f, CUR), fin = f.fin ? ` · jusqu'à ${mShort(f.fin)} ${pm(f.fin).y}` : '';
-    return `<button class="item ${bool(f.actif) && (!f.fin || f.fin >= CUR) ? '' : 'off'}" data-fid="${esc(f.id)}"><span class="day">le ${esc(f.jour)}</span><span class="lbl"><b>${esc(f.libelle)}</b><small>${esc(f.categorie || 'Autre')} · ${FREQ[f.frequence] || 'Mensuel'}${f.frequence === 'T' || f.frequence === 'A' ? ' (' + MONTHS[(num(f.moisRef) || 1) - 1] + ')' : ''}${fin}${stateTxt('f' + f.id, num(f.jour), occ, bool(f.actif))}</small></span><span class="amt ${f.sens === '+' ? 'pos' : 'neg'}">${f.sens === '+' ? '+' : '−'}${eur(num(f.montant) || 0)}${f.frequence === 'T' || f.frequence === 'A' ? `<small>≈ ${eur(per(f))}/mois</small>` : ''}</span></button>`;
-  };
-  const rowV = v => `<button class="item ${bool(v.actif) ? '' : 'off'}" data-vid="${esc(v.id)}"><span class="day">le ${esc(v.jour)}</span><span class="lbl"><b>${esc(v.libelle || 'Virement')}<span class="tag">lié</span></b><small>${esc(accName(v.de))} → ${esc(accName(v.vers))}${v.profil ? ' · ' + esc(pname(v.profil)) : ''}${stateTxt('v' + v.id, num(v.jour), occursV(v, CUR), bool(v.actif))}</small></span><span class="amt ${vrIn(v) ? 'pos' : 'neg'}">${vrIn(v) ? '+' : '−'}${eur(num(v.montant) || 0)}</span></button>`;
-  const rev = sortd(fx.filter(f => f.sens === '+')), men = sortd(fx.filter(f => f.sens !== '+' && (f.frequence || 'M') === 'M')), oth = sortd(fx.filter(f => f.sens !== '+' && f.frequence && f.frequence !== 'M'));
-  const env = catsOf(acc).reduce((a, c) => a + (num(c.budget) || 0), 0);
-  return `<section class="view">
-    <div class="hero" style="gap:10px">
-      <div class="kv"><div><small>Rentrées fixes / mois</small><b class="pos">${eur(totR)}</b></div><div><small>Sorties fixes / mois</small><b>${eur(tot)}</b></div></div>
-      <div class="hint" style="font-size:13px">Reste pour vivre après les fixes : <b style="color:var(--ink)">${eur(totR - tot)}</b>${env ? `, dont ${eur0(env)} en enveloppes` : ''}.</div>
-    </div>
-    <div class="block"><div class="rowhead"><h2>Virements liés</h2><span class="sub">entre les comptes</span></div>
-      <div class="list">${vr.length ? sortd(vr).map(rowV).join('') : `<div class="empty">Aucun virement lié.</div>`}</div>
-      <div class="hint">Une seule ligne : elle débite un compte et crédite l'autre automatiquement.</div></div>
-    <div class="block"><div class="rowhead"><h2>Rentrées</h2></div><div class="list">${rev.length ? rev.map(row).join('') : `<div class="empty">Aucune rentrée fixe (salaire…).</div>`}</div></div>
-    <div class="block"><div class="rowhead"><h2>Charges mensuelles</h2><span class="sub">${men.length}</span></div><div class="list">${men.length ? men.map(row).join('') : `<div class="empty">Aucune charge mensuelle.</div>`}</div></div>
-    <div class="block"><div class="rowhead"><h2>Trimestrielles et annuelles</h2></div><div class="list">${oth.length ? oth.map(row).join('') : `<div class="empty">Aucune.</div>`}</div></div>
-    <div class="actions"><button class="btn" data-newfixed="1">Ajouter une charge, rentrée ou virement fixe</button></div>
-  </section>`;
-}
-
-/* ----- Onglet Saisir ----- */
-function vAdd() {
-  const acc = UI.acc, cats = catsOf(acc).map(c => c.nom), oth = otherAcc(acc);
-  if (!cats.includes(draft.cat)) draft.cat = cats[0] || null;
-  const others = accs().filter(a => a.id !== acc);
-  if (!others.find(a => a.id === draft.to)) draft.to = others[0] && others[0].id;
-  const isVir = draft.sens === 'v' && others.length > 0;
-  return `<section class="view"><form class="form" id="addForm" novalidate>
-    <div class="seg" role="group" aria-label="Type" style="grid-template-columns:1fr 1fr 1fr"><button type="button" data-sens="-" aria-pressed="${draft.sens === '-'}">Dépense</button><button type="button" data-sens="+" aria-pressed="${draft.sens === '+'}">Rentrée</button>${others.length ? `<button type="button" data-sens="v" aria-pressed="${isVir}">Virement</button>` : ''}</div>
-    <div class="amountbox"><input id="amt" inputmode="decimal" placeholder="0,00" aria-label="Montant" autocomplete="off"><span>€</span></div>
-    ${isVir ? (others.length > 1 ? `<div class="field"><label for="vto">Vers</label><select id="vto" data-vto="1">${others.map(a => `<option value="${esc(a.id)}" ${a.id === draft.to ? 'selected' : ''}>${esc(a.nom)}</option>`).join('')}</select></div>` : '') + `<div class="note">De <b>${esc(accName(acc))}</b> vers <b>${esc(accName(draft.to))}</b> : l'opération apparaît sur les deux comptes.</div>` :
-    `<div class="field"><label>Type de dépense</label><div class="chips">${cats.map(c => `<button type="button" class="chip" data-cat="${esc(c)}" aria-pressed="${c === draft.cat}">${catHtml(c)}</button>`).join('')}<button type="button" class="chip" data-newcat="${esc(acc)}" style="border-style:dashed;color:var(--accent)">＋ Nouvelle</button></div></div>`}
-    <div class="two"><div class="field"><label for="dt">Date</label><input id="dt" type="date" value="${TODAY_ISO}"></div>
-    <div class="field"><label for="lb">Libellé</label><input id="lb" placeholder="${isVir ? 'Ex. Complément courses' : 'Ex. Drive'}" autocomplete="off"></div></div>
-    ${isVir ? '' : `<label class="switch" for="addExc"><span style="font-size:14px">Exceptionnel (hors habitudes)</span><input type="checkbox" id="addExc"></label>`}
-    <div class="hint" style="font-size:13px">Compte : <b style="color:var(--ink)">${esc(accName(acc))}</b>. Une date dans un mois futur crée une opération prévue, prise en compte dans les prévisions.</div>
-    <button class="btn" type="submit">Enregistrer</button>
-  </form></section>`;
-}
-
-/* ----- Onglet Prévisions ----- */
-function vFore() {
-  const seg = `<div class="seg" role="group" aria-label="Vue"><button data-ftab="budget" aria-pressed="${UI.foreTab === 'budget'}">Budget</button><button data-ftab="tax" aria-pressed="${UI.foreTab === 'tax'}">Impôts</button></div>`;
-  return seg + (UI.foreTab === 'tax' ? vTax() : vBudget());
-}
-function vBudget() {
-  const acc = UI.acc;
-  if (!started(acc)) return `<section class="view"><div class="note">Indique d'abord le solde actuel du compte dans l'onglet Mois.</div></section>`;
-  const seuil = seuilOf(acc), rows = forecast(acc, UI.horizon, { sim: true, mode: UI.mode }), base = forecast(acc, UI.horizon, { mode: UI.mode });
-  const last = rows[rows.length - 1], lastBase = base[base.length - 1];
-  const avgNet = rows.slice(1).reduce((a, r) => a + r.net, 0) / Math.max(1, rows.length - 1), neg = rows.find(r => r.low.v < 0);
-  const W = 340, H = 140, L = 8, B = 22, mxA = Math.max(...rows.map(r => Math.abs(r.net)), 1), bw = (W - L * 2) / rows.length, y0 = (H - B) / 2 + 4;
-  const bars = rows.map((r, i) => { const h = Math.abs(r.net) / mxA * ((H - B) / 2 - 12), x = L + i * bw + bw * .18, w = bw * .64, y = r.net >= 0 ? y0 - h : y0;
-    return `<rect x="${x}" y="${y}" width="${w}" height="${Math.max(1, h)}" rx="3" fill="var(--${r.net >= 0 ? 'good' : 'bad'})"/><text x="${x + w / 2}" y="${r.net >= 0 ? y - 4 : y + h + 11}" text-anchor="middle" font-size="9.5" fill="var(--muted)">${r.net >= 0 ? '+' : '−'}${Math.round(Math.abs(r.net))}</text><text x="${x + w / 2}" y="${H - 4}" text-anchor="middle" font-size="10" fill="var(--muted)">${mShort(r.k)}</text>`; }).join('');
-  const sims = DB.simulations.filter(s => s.compte === acc).sort((a, b) => simI(a) - simI(b) || String(a.id).localeCompare(String(b.id)));
-  const habits = catList(acc).map(c => ({ n: catLabel(c.nom), h: habit(acc, c.nom), b: num(c.budget) })).filter(x => x.h > 0.5 || x.b), hin = habitIn(acc);
-  const sum = simsSummary(acc), stL = status(last.end, seuil);
-  return `<section class="view">
-    <div class="chips" role="group" aria-label="Horizon">${[3, 6, 12].map(n => `<button class="chip" data-h="${n}" aria-pressed="${UI.horizon === n}">${n} mois</button>`).join('')}</div>
-    <div class="seg" role="group" aria-label="Base de calcul"><button data-mode="habits" aria-pressed="${UI.mode === 'habits'}">Selon nos habitudes</button><button data-mode="budget" aria-pressed="${UI.mode === 'budget'}">Selon nos budgets</button></div>
-    ${UI.mode === 'budget' ? '<div class="hint">Les catégories sans budget suivent les habitudes.</div>' : ''}
-    <div class="hero">
-      <div class="rowhead"><span class="sub">Solde fin ${mLabel(last.k)}</span><span class="pill ${stL.c}">${stL.t}</span></div>
-      <div class="big num">${eur0(last.end)}</div>
-      <div class="kv"><div><small>Gagné en moyenne / mois</small><b style="color:var(--${avgNet >= 0 ? 'good' : 'bad'})">${sgn(Math.round(avgNet))}</b></div>
-      <div><small>Épargnable sur la période</small><b>${eur0(Math.max(0, last.end - seuil))}</b></div></div>
-      ${neg ? `<div class="alert bad">Risque de découvert en ${mLabel(neg.k)} (point bas ${eur0(neg.low.v)} le ${neg.low.d})</div>` : ''}
-      ${DB.simulations.some(s => s.compte === acc && bool(s.actif) && simI(s) >= 0) ? `<div class="hint" style="font-size:13px">Sans les simulations : ${eur0(lastBase.end)}</div>` : ''}
-      ${UI.mode === 'habits' && !hasHistory(acc) ? `<div class="hint">Peu d'historique pour l'instant : les budgets d'enveloppes servent d'estimation jusqu'à la fin du premier mois.</div>` : ''}
-      <svg class="curve" viewBox="0 0 ${W} ${H}" role="img" aria-label="Solde gagné ou perdu par mois"><line x1="${L}" x2="${W - L}" y1="${y0}" y2="${y0}" stroke="var(--line)"/>${bars}</svg>
-    </div>
-    <div class="block"><div class="rowhead"><h2>Et si…</h2><span class="sub">simulations</span></div>
-      ${sum ? (() => { const c = sum.ratio <= 0.5 ? 'good' : sum.ratio <= 0.9 ? 'warn' : 'bad';
-        return `<div class="note ${c}"><b>Toutes les simulations ensemble :</b> ${sum.n} achats pour ${eur0(sum.total)}. Au plus fort, il faut mettre <b>${eur0(sum.peak)}/mois</b> de côté, soit <b>${sum.marge > 0 ? Math.round(sum.ratio * 100) + ' %' : 'plus que tout'}</b> de la marge habituelle (${eur0(sum.marge)}). Les achats sont financés par ordre de date.</div>`; })() : ''}
-      ${sims.map(s => { const past = simI(s) < 0;
-        if (past) return `<div class="simcard off"><div class="simhead"><div><b>${esc(s.libelle)}</b><div class="mini">${eur0(num(s.montant))} en ${mLabel(s.mois)} · date passée</div></div></div><div class="actions"><button class="btn ghost small" data-simdel="${esc(s.id)}">Retirer</button></div></div>`;
-        const p = simPlan(s);
-        return `<div class="simcard ${bool(s.actif) ? '' : 'off'}">
-        <div class="simhead"><div><b>${esc(s.libelle)}</b><div class="mini" style="font-size:13px">${eur0(num(s.montant))} en ${mLabel(s.mois)}</div></div>
-        <div style="display:flex;gap:8px;align-items:center"><span class="pill ${p.c}">${p.label}</span><input type="checkbox" aria-label="Activer la simulation" data-simtog="${esc(s.id)}" ${bool(s.actif) ? 'checked' : ''}></div></div>
-        ${p.k > 0 ? `<div class="save"><strong class="num">${eur0(p.need)}</strong><span>à mettre de côté par mois, de ${MONTHS_L[pm(addM(CUR, 1)).m]} à ${MONTHS_L[pm(s.mois).m]} (${p.k} mois)</span></div>` : ''}
-        <div class="note ${p.c}">${p.txt}</div>
-        <div class="actions"><button class="btn ghost small" data-simdel="${esc(s.id)}">Retirer</button></div></div>`; }).join('') || `<div class="note">Teste un achat avant de le faire : il s'ajoute aux prévisions sans toucher au réel.</div>`}
-      <form class="form" id="simForm" novalidate style="gap:10px">
-        <div class="two"><div class="field"><label for="simL">Achat envisagé</label><input id="simL" placeholder="Ex. Week-end" autocomplete="off"></div>
-        <div class="field"><label for="simA">Montant (€)</label><input id="simA" inputmode="decimal" placeholder="800" autocomplete="off"></div></div>
-        <div class="two"><div class="field"><label for="simM">Mois de l'achat</label><select id="simM">${Array.from({ length: 24 }, (_, i) => { const k = addM(CUR, i); return `<option value="${k}" ${i === 3 ? 'selected' : ''}>${mLabel(k)}</option>`; }).join('')}</select></div>
-        <div class="field" style="justify-content:flex-end"><button class="btn ghost" type="submit">Simuler</button></div></div>
-      </form>
-    </div>
-    <div class="block"><div class="rowhead"><h2>Nos habitudes</h2><span class="sub">moyenne / mois</span></div>
-      <div class="list">${habits.length ? habits.map(x => { const d = x.b ? x.h - x.b : null;
-        return `<div class="habit"><b>${esc(x.n)}</b><span>${x.b ? 'budget ' + eur0(x.b) : 'sans enveloppe'}</span><span style="font-weight:700;color:var(--${d !== null && d > 15 ? 'bad' : d !== null && d < -15 ? 'good' : 'ink'})">${eur0(x.h)}</span></div>`; }).join('') : `<div class="empty">Les habitudes apparaîtront au fil des saisies.</div>`}</div>
-      ${hin > 0.5 ? `<div class="hint">Rentrées ponctuelles habituelles (hors fixes) : <b>${eur0(hin)}</b> par mois, comptées dans les prévisions.</div>` : ''}
-      <div class="hint">Médiane des 3 derniers mois, mêlée au mois en cours à partir du 10. Les mouvements exceptionnels et les virements entre tes comptes n'y entrent pas.</div>
-    </div>
-    <div class="block"><h2>Mois par mois</h2>
-      <div class="tablewrap"><table><thead><tr><th>Mois</th><th>Rentrées</th><th>Fixes</th><th>Variables</th><th>Fin</th></tr></thead><tbody>
-      ${rows.map(r => { const st = status(r.end, seuil).c; return `<tr><td>${mShort(r.k)}${pm(r.k).m === 0 ? ' ' + String(pm(r.k).y).slice(2) : ''}${r.k === CUR ? ' · en cours' : ''}</td><td class="pos">${eur0(r.rev)}</td><td>${eur0(r.chg)}</td><td>${eur0(r.vari)}</td><td class="end" style="color:var(--${st === 'good' ? 'ink' : st})">${eur0(r.end)}</td></tr>`; }).join('')}
-      </tbody></table></div>
-    </div>
-  </section>`;
-}
-let TAX_DELTA = 0;
-function vTax() {
-  const X = taxParams(), t = calcTax(X, TAX_DELTA), t0 = calcTax(X, 0), t1 = calcTax(X, TAX_DELTA + 1000);
-  const p = profiles(), n1 = (p[0] || {}).nom || 'Personne 1', n2 = (p[1] || {}).nom || 'Personne 2';
-  const ecart = t.prelev - t.duSal, pct = t.duSal > 0 ? Math.abs(ecart) / t.duSal : 0;
-  const verdict = t.sal <= 0 ? { c: '', t: 'À compléter', m: 'Renseigne les salaires nets imposables plus bas pour lancer l\'estimation.' }
-    : Math.abs(ecart) < 150 ? { c: 'good', t: 'Taux bien calé', m: `Écart d'environ ${eur0(Math.abs(ecart))} sur l'année : rien à changer.` }
-    : ecart > 0 ? { c: 'warn', t: 'Prélèvement trop élevé', m: `Environ ${eur0(ecart)} de trop sur l'année, remboursés l'été suivant. ${pct > 0.10 && ecart > 200 ? 'L\'écart dépasse 10 % et 200 € : une baisse du taux est possible sur impots.gouv.fr, rubrique « Gérer mon prélèvement à la source ».' : 'L\'écart reste sous les seuils pour demander une baisse.'}` }
-    : { c: 'bad', t: 'Prélèvement trop faible', m: `Il manquera environ ${eur0(-ecart)}, régularisés en fin d'année suivante. Le taux peut être augmenté librement sur impots.gouv.fr pour lisser.` };
-  const maxQ = 90000, seg = IMPOT.tranches.slice(0, 4).map((tr, k) => { const lo = k ? IMPOT.tranches[k - 1][0] : 0, hi = Math.min(tr[0], maxQ); return `<i style="width:${(hi - lo) / maxQ * 100}%;background:var(--${['sunk', 'accent-soft', 'warn-soft', 'bad-soft'][k]})"></i>`; }).join('');
-  const inp = (id, key, val, label, attrs) => `<div class="field"><label for="${id}">${label}</label><input id="${id}" data-tax="${key}" inputmode="decimal" value="${fr(val)}" ${attrs || ''}></div>`;
-  return `<section class="view">
-    <div class="hero">
-      <div class="rowhead"><span class="sub">Impôt estimé du foyer</span><span class="pill ${t.tmi >= 0.30 ? 'warn' : 'good'}">Tranche ${Math.round(t.tmi * 100)} %</span></div>
-      <div class="big num">${eur0(t.I)}</div>
-      <div class="kv"><div><small>Revenu imposable</small><b>${eur0(t.R)}</b></div><div><small>Parts / taux moyen</small><b>${fr(t.parts)} · ${t.R > 0 ? fr((t.I / t.R * 100).toFixed(1)) : '0'} %</b></div></div>
-      <div style="display:flex;flex-direction:column;gap:6px">
-        <div class="tranche">${seg}<span class="tranche-marker" style="left:calc(${Math.min(t.q, maxQ) / maxQ * 100}% - 1px)"></span></div>
-        <div class="tlegend"><span>0 %</span><span>11 %</span><span>30 %</span><span>41 %</span></div>
-      </div>
-      <div class="note">${t.tmi < 0.45 ? `Encore <b>${eur0(t.toNext)}</b> de salaire net imposable avant la tranche à <b>${Math.round(t.nextRate * 100)} %</b>.` : 'Tranche la plus haute.'} ${t.dec > 0 ? `Décote appliquée : ${eur0(t.dec)}.` : ''} ${t.plaf ? 'Plafonnement du quotient familial appliqué.' : ''}</div>
-    </div>
-    <div class="block"><div class="rowhead"><h2>Prélèvement à la source</h2></div>
-      <div class="hero" style="gap:12px">
-        <div class="kv"><div><small>Taux actuel</small><b>${fr(X.taux)} %</b></div><div><small>Taux estimé juste</small><b>${fr(t.tauxEst.toFixed(1))} %</b></div></div>
-        <div class="kv"><div><small>Prélevé sur l'année</small><b>${eur0(t.prelev)}</b></div><div><small>Impôt dû sur les salaires</small><b>${eur0(t.duSal)}</b></div></div>
-        <div class="note ${verdict.c}"><b>${verdict.t}.</b> ${verdict.m}</div>
-      </div></div>
-    <div class="block"><div class="rowhead"><h2>Simuler un changement de revenu</h2></div>
-      <div class="hero" style="gap:10px">
-        <label class="daysim" for="taxdelta" style="color:var(--ink)">Prime / augmentation (${esc(n1)}) <input type="range" id="taxdelta" min="-10000" max="20000" step="500" value="${TAX_DELTA}"> <b class="num">${TAX_DELTA >= 0 ? '+' : ''}${eur0(TAX_DELTA)}</b></label>
-        <div class="kv"><div><small>Impôt après changement</small><b>${eur0(t.I)}</b></div><div><small>Différence</small><b style="color:var(--${t.I > t0.I + 0.5 ? 'bad' : 'good'})">${sgn(Math.round(t.I - t0.I))}</b></div></div>
-        <div class="note">Sur 1 000 € de salaire en plus, environ <b>${eur0(t1.I - t.I)}</b> partent en impôt.</div>
-      </div></div>
-    <div class="block"><div class="rowhead"><h2>Données du foyer</h2></div>
-      <div class="form">
-        <div class="seg"><button type="button" data-taxmode="commune" aria-pressed="${X.mode === 'commune'}">Déclaration commune</button><button type="button" data-taxmode="seule" aria-pressed="${X.mode === 'seule'}">Déclaration séparée</button></div>
-        <div class="two">${inp('tx-s1', 'impSal1', X.sal1, 'Salaire net imposable ' + esc(n1) + ' / an')}${X.mode === 'commune' ? inp('tx-s2', 'impSal2', X.sal2, 'Salaire net imposable ' + esc(n2) + ' / an') : inp('tx-k', 'impEnfants', X.kids, 'Enfants rattachés')}</div>
-        <div class="two">${X.mode === 'commune' ? inp('tx-k', 'impEnfants', X.kids, 'Enfants à charge') : ''}${inp('tx-t', 'impTaux', X.taux, 'Taux de prélèvement actuel (%)')}</div>
-        <div class="two">${inp('tx-a', 'impAutres', X.autres, 'Autres revenus (micro-entreprise) / an')}
-        <div class="field"><label for="tx-ab">Abattement</label><select id="tx-ab" data-tax="impAutresAb">${[71, 50, 34].map(a => `<option value="${a}" ${a === X.autresAb ? 'selected' : ''}>${a} %</option>`).join('')}</select></div></div>
-      </div>
-      <div class="hint">Estimation indicative : ${IMPOT.annee}, abattement de 10 % sur les salaires. Le simulateur officiel d'impots.gouv.fr fait foi. Le salaire net imposable figure sur la fiche de paie de décembre (cumul annuel).</div>
-    </div>
-  </section>`;
-}
-
-/* ----- Onglet Réglages ----- */
-function vSet() {
-  const sysDark = matchMedia('(prefers-color-scheme: dark)').matches, dark = UI.theme === 'dark' || (UI.theme === 'auto' && sysDark);
-  const accBlock = A => { const k = A.id, cats = catsOf(k);
-    return `<div class="hero" style="gap:12px"><div class="rowhead"><h2>${esc(A.nom)}</h2><span class="sub">${A.proprietaire ? 'privé' : DB.profils.length > 1 ? 'partagé' : ''}</span></div>
-    ${isShared(k) ? `<div class="hint">Compte partagé : les changements ici s'appliquent aussi pour ${esc(otherNames())}.</div>` : ''}
-    <div class="field"><label for="an-${esc(k)}">Nom du compte</label><input id="an-${esc(k)}" data-accname="${esc(k)}" value="${esc(A.nom)}"></div>
-    <div class="two"><div class="field"><label for="op-${esc(k)}">Solde au 1er ${started(k) ? MONTHS_L[pm(startMonth(k)).m] : 'du mois de départ'}</label><input id="op-${esc(k)}" data-open="${esc(k)}" inputmode="decimal" value="${fr(A.soldeDepart)}" placeholder="non renseigné"></div>
-    <div class="field"><label for="se-${esc(k)}">Seuil de sécurité (€)</label><input id="se-${esc(k)}" data-seuil="${esc(k)}" inputmode="decimal" value="${fr(A.seuil)}"></div></div>
-    <div class="field"><label for="md-${esc(k)}">Mois de départ</label><input id="md-${esc(k)}" type="month" data-mdep="${esc(k)}" value="${esc(startMonth(k))}" max="${CUR}"></div>
-    <div class="hint">Le solde de départ est le solde au 1er du mois de départ. Pour recaler en cours de mois, utilise plutôt « Corriger le solde » dans l'onglet Mois.</div>
-    <div class="field"><label>Catégories de dépenses</label><div class="list">${cats.length ? cats.map(c => `<button class="item ${c.nom.includes(SEP) ? 'child' : ''}" data-editcat="${esc(c.id)}"><span class="day">${c.nom.includes(SEP) ? '↳' : num(c.budget) ? '◔' : '·'}</span><span class="lbl"><b>${esc(leafOf(c.nom))}</b><small>${num(c.budget) ? 'enveloppe mensuelle' : 'sans enveloppe'}</small></span><span class="amt">${num(c.budget) ? eur0(num(c.budget)) : ''}</span></button>`).join('') : '<div class="empty">Aucune catégorie.</div>'}</div></div>
-    <button class="btn ghost small" data-newcat="${esc(k)}">＋ Ajouter une catégorie</button></div>
-    ${(() => {
-      const cands = DB.fixes.filter(f => f.compte === k && bool(f.actif) && f.sens === '+' && (f.frequence || 'M') === 'M');
-      if (!cands.length) return '';
-      const fid = salaryFixeId(k), on = payOn(k), PS2 = on && payState(k);
-      return `<div class="hero" style="gap:10px"><div class="rowhead"><h2>Mois basé sur la paie</h2></div>
-      <label class="switch" for="payOn-${esc(k)}"><span>Le mois affiché (onglet Mois) commence à la paie plutôt qu'au calendaire<small class="mini" style="display:block">Détection automatique de l'arrivée de la rentrée, projection de la prochaine</small></span><input type="checkbox" id="payOn-${esc(k)}" data-payon="${esc(k)}" ${on ? 'checked' : ''}></label>
-      ${on ? (cands.length > 1 ? `<div class="field"><label for="payF-${esc(k)}">Rentrée qui déclenche le mois</label><select id="payF-${esc(k)}" data-payfixe="${esc(k)}">${cands.map(f => `<option value="${esc(f.id)}" ${f.id === fid ? 'selected' : ''}>${esc(f.libelle)}</option>`).join('')}</select></div>` : `<div class="hint">Déclencheur : <b>${esc(cands[0].libelle)}</b>.</div>`) : ''}
-      ${on ? (PS2 ? `<div class="hint">Période en cours : du ${dLabel(PS2.start)} au ${dLabel(PS2.end)}${PS2.manual ? ' (date de fin fixée à la main)' : ' (estimation automatique, d\'après les dernières paies)'}.</div>
-      <div class="two"><div class="field"><label for="payEnd-${esc(k)}">Date de fin de la période (modifiable)</label><input type="date" id="payEnd-${esc(k)}" data-payend="${esc(k)}" value="${esc(PS2.end)}"></div>${PS2.manual ? `<button type="button" class="btn ghost small" data-payauto="${esc(k)}" style="align-self:end">Recalculer automatiquement</button>` : ''}</div>` : `<div class="hint">Pas encore de paie vue sur ce compte depuis le début du mois de départ : le mois calendaire est utilisé pour l'instant.</div>`) : ''}
-      </div>`; })()}
-    `; };
-  const syncTxt = { ok: 'Synchronisé', wait: 'Envoi en cours…', off: 'Hors ligne', err: 'Accès coupé' }[SYNC.state] || '';
-  return `<section class="view">
-    <div class="hero" style="gap:6px"><div class="rowhead"><h2>Apparence</h2></div>
-      <label class="switch" for="th-auto"><span>Suivre le réglage du téléphone</span><input type="checkbox" id="th-auto" data-theme-auto="1" ${UI.theme === 'auto' ? 'checked' : ''}></label>
-      <label class="switch" for="th-dark" style="${UI.theme === 'auto' ? 'opacity:.45' : ''}"><span>Mode sombre</span><input type="checkbox" id="th-dark" data-theme-dark="1" ${dark ? 'checked' : ''} ${UI.theme === 'auto' ? 'disabled' : ''}></label>
-      <div class="hint">${UI.theme === 'auto' ? "L'appli passe en sombre quand le téléphone l'est." : 'Choix forcé, quel que soit le réglage du téléphone.'} Réglage propre à ce téléphone.</div>
-    </div>
-    ${vBankSet()}
-    ${accs().map(accBlock).join('')}
-    ${vProfiles()}
-    <div class="hero" style="gap:8px"><div class="rowhead"><h2>Synchronisation</h2><span class="pill ${SYNC.state === 'ok' ? 'good' : SYNC.state === 'err' ? 'bad' : 'warn'}">${syncTxt}</span></div>
-      <div class="hint">Les saisies partent tout de suite vers le Google Sheet et l'appli se met à jour seule toutes les 30 secondes. Sans réseau, elles sont gardées et envoyées au retour de la connexion.${QUEUE.length ? ` <b>${QUEUE.length} modification(s) en attente d'envoi.</b>` : ''}</div>
-      <div class="hint">Dernière synchro : ${SYNC.last ? new Date(SYNC.last).toLocaleString('fr-FR', { dateStyle: 'short', timeStyle: 'short' }) : 'jamais'}</div>
-      <button class="btn ghost small" data-syncnow="1">Synchroniser maintenant</button>
-    </div>
-  </section>`;
-}
-
-/* ================= Premier lancement ================= */
-const CATS_PERSO = ['Courses', 'Carburant', 'Restaurants', 'Loisirs', 'Shopping', 'Santé', 'Cadeaux', 'Divers'];
-const CATS_COMMUN = ['Courses', 'Maison', 'Enfants', 'Santé', 'Sorties', 'Restaurants', 'Divers'];
-const catOps = (acc, list) => list.map((n, i) => upd('Categories', { id: uid(), compte: acc, nom: n, budget: '', ordre: i + 1 }));
-const ONB = { step: 0, name: '', mode: '', partner: '', commun: true, busy: false };
-function vOnboard() {
-  const O = ONB, head = n => `<div class="steps" style="display:flex;gap:6px">${[0, 1, 2].map(i => `<i style="flex:1;height:4px;border-radius:9px;background:var(--${i <= n ? 'accent' : 'line'})"></i>`).join('')}</div>`;
-  if (O.step === 0) return `<section class="view">${head(0)}<h2 style="font-size:24px">Bienvenue sur Le 31</h2><p class="hint" style="font-size:14px">L'appli qui vous dit si vous tenez jusqu'au 31. Deux questions pour commencer.</p>
-    <form class="form" id="onbName" novalidate><div class="field"><label for="onbN">Ton prénom</label><input id="onbN" value="${esc(O.name)}" placeholder="Ex. Alex" autocomplete="given-name"></div><button class="btn" type="submit">Continuer</button></form></section>`;
-  if (O.step === 1) return `<section class="view">${head(1)}<h2 style="font-size:24px">Tu utilises Le 31…</h2>
-    <div class="two"><button class="chip" style="border-radius:16px;padding:14px;text-align:left" data-onbmode="solo" aria-pressed="${O.mode === 'solo'}"><b style="font-size:16px;display:block">Seul</b><span style="font-weight:500">Mon compte, et un compte commun si j'en ai un</span></button>
-    <button class="chip" style="border-radius:16px;padding:14px;text-align:left" data-onbmode="duo" aria-pressed="${O.mode === 'duo'}"><b style="font-size:16px;display:block">À deux</b><span style="font-weight:500">Un perso chacun et un compte commun</span></button></div>
-    ${O.mode === 'duo' ? `<div class="field"><label for="onbP">Prénom de ton/ta partenaire</label><input id="onbP" value="${esc(O.partner)}" placeholder="Ex. Camille" autocomplete="off"></div>
-      <div class="note">Chacun aura son propre lien d'accès. ${esc(O.partner || 'Ton/ta partenaire')} verra le <b>compte commun</b> et <b>son</b> compte perso, jamais le tien.</div>` : ''}
-    ${O.mode === 'solo' ? `<label class="switch" for="onbC"><span>J'ai aussi un compte commun à suivre</span><input type="checkbox" id="onbC" ${O.commun ? 'checked' : ''}></label>` : ''}
-    <div class="actions"><button class="btn ghost" data-onbstep="0">Retour</button><button class="btn" data-onbstep="2">Continuer</button></div></section>`;
-  const accsL = [`<b>Compte perso de ${esc(O.name)}</b> · visible seulement par toi`];
-  if (O.mode === 'duo') accsL.push(`<b>Compte perso de ${esc(O.partner)}</b> · visible seulement par ${esc(O.partner)}, démarré sur son téléphone`);
-  if (O.mode === 'duo' || O.commun) accsL.push(`<b>Compte commun</b> · visible par ${O.mode === 'duo' ? 'vous deux' : 'toi'}`);
-  return `<section class="view">${head(2)}<h2 style="font-size:24px">Vos comptes</h2>
-    <div class="list">${accsL.map(l => `<div class="item" disabled style="grid-template-columns:1fr"><span class="lbl" style="white-space:normal">${l}</span></div>`).join('')}</div>
-    <div class="hint">Les noms se changent ensuite dans Réglages.${O.mode === 'duo' ? ` Tu enverras son lien à ${esc(O.partner)} depuis Réglages > Profils.` : ''}</div>
-    <div class="actions"><button class="btn ghost" data-onbstep="1">Retour</button><button class="btn" data-onbdone="1" ${O.busy ? 'disabled' : ''}>${O.busy ? 'Création…' : 'Créer mes comptes'}</button></div></section>`;
-}
-async function finishOnboard() {
-  const O = ONB; if (O.busy) return;
-  const p1 = 'p' + uid(), ops = [upd('Profils', { id: p1, nom: O.name, perso: 'oui', ordre: 1 })];
-  ops.push(upd('Comptes', { id: 'perso-' + p1, nom: 'Perso ' + O.name, proprietaire: p1, soldeDepart: '', moisDepart: '', seuil: 200, ordre: 1 }), ...catOps('perso-' + p1, CATS_PERSO));
-  if (O.mode === 'duo') ops.push(upd('Profils', { id: 'p' + uid(), nom: O.partner, perso: 'oui', ordre: 2 }));
-  if (O.mode === 'duo' || O.commun) ops.push(upd('Comptes', { id: 'commun', nom: 'Compte commun', proprietaire: '', soldeDepart: '', moisDepart: '', seuil: 150, ordre: 2 }), ...catOps('commun', CATS_COMMUN));
-  if (O.mode === 'solo') ops.push(upd('Parametres', { cle: 'impMode', valeur: 'seule' }));
-  O.busy = true; render();
-  try { const j = await api({ action: 'ops', ops: clean(ops), associer: p1 }); UI.acc = 'perso-' + p1; received(j.data, j.moi); toast('Comptes créés'); }
-  catch (e) { toast(e instanceof TypeError ? 'Connexion nécessaire pour créer les comptes' : 'Erreur : ' + e.message); }
-  O.busy = false; render();
-}
-// La personne invitée crée son compte perso à sa première ouverture
-function ensurePerso() {
-  if (!ME) return;
-  const p = DB.profils.find(x => x.id === ME);
-  if (!p || p.perso !== 'oui' || DB.comptes.some(c => c.proprietaire === ME)) return;
-  const id = 'perso-' + ME;
-  UI.acc = id;
-  commit([upd('Comptes', { id, nom: 'Perso ' + p.nom, proprietaire: ME, soldeDepart: '', moisDepart: '', seuil: 200, ordre: 1 }), ...catOps(id, CATS_PERSO)]);
-}
-
 /* ================= Import de relevé (CSV / OFX) ================= */
 const NORM = s => String(s || '').toUpperCase().normalize('NFD').replace(/[̀-ͯ]/g, '');
 const STOP = new Set('PRLV PRELEVEMENT PRELEV SEPA CB CARTE PAIEMENT PAIE VIR VIREMENT VIRT INST INSTANTANE RECU RECUE EMIS EMISE DE DU DES LA LE LES ET FACT FACTURE ECH REF MANDAT ICS RUM NUM NO PAR POUR SUR AVEC EN AU AUX FR EUR WWW COM SA SAS SARL MOTIF VERS BENEF BENEFICIAIRE ORDRE EMETTEUR'.split(' '));
@@ -1207,430 +580,162 @@ function smartName(lib) {
   const w = words(lib).slice(0, 3); if (!w.length) return isVIR(N) ? 'Virement' : pretty(motifOf(lib).replace(/\d+/g, '').trim() || 'Opération');
   return (isVIR(N) ? 'Virement ' : '') + pretty(w.join(' '));
 }
-const AUTO = [
-  [/SALAIRE|REMUNERATION|POLE EMPLOI|FRANCE TRAVAIL|\bCAF\b|ALLOCATION|PENSION|RETRAITE/, 'Revenus'],
-  [/DGFIP|IMPOT|TRESOR PUBLIC|FINANCES PUBLIQUES|DIRECTION GENERALE DE/, 'Impôts'],
-  [/\bPRET\b|COFIDIS|CETELEM|SOFINCO|FRANFINANCE|ONEY/, 'Crédits'],
-  [/MUTUELLE|ASSUR|MAAF|MACIF|MATMUT|\bAXA\b|ALLIANZ|\bGMF\b|\bMAIF\b|GROUPAMA|HARMONIE|MGEN|GENERALI/, 'Assurances'],
-  [/\bEDF\b|ENGIE|TOTALENERGIES ELEC|VEOLIA|\bSAUR\b|SUEZ|\bEAU\b|GRDF|ENERCOOP|EKWATEUR/, 'Énergie'],
-  [/FREE MOBILE|FREE TELECOM|\bFREE\b|ORANGE|\bSFR\b|BOUYGUES|\bSOSH\b|RED BY/, 'Abonnements'],
-  [/NETFLIX|SPOTIFY|DEEZER|DISNEY|CANAL|AMAZON PRIME|APPLE\.COM|ITUNES|GOOGLE PLAY|YOUTUBE/, 'Abonnements'],
-  [/CARREFOUR|LECLERC|AUCHAN|INTERMARCHE|\bLIDL\b|\bALDI\b|SUPER U|HYPER U|\bU EXPRESS|CASINO|FRANPRIX|MONOPRIX|NETTO|GRAND FRAIS|PICARD|\bSPAR\b|PROXI|\bCORA\b|BIOCOOP|MARCHE|BOUCHERIE|PRIMEUR/, 'Courses'],
-  [/TOTAL|ESSO|SHELL|\bBP\b|\bAVIA\b|STATION|CARBU|DYNEFF|\bAGIP\b|AS24/, 'Carburant'],
-  [/RESTAU|MC ?DONALD|MCDO|BURGER|\bKFC\b|DELIVEROO|UBER ?EATS|PIZZ|BRASSERIE|\bCAFE\b|BOULANG|SUSHI|KEBAB|STARBUCKS|\bBAR\b|TRAITEUR/, 'Restaurants'],
-  [/PHARMA|DOCTEUR|\bDR\b|MEDEC|CPAM|AMELI|DENTIST|OPTIC|LABO|KINE|HOPITAL|CLINIQUE|OSTEO/, 'Santé'],
-  [/AMAZON|FNAC|DARTY|ZALANDO|VINTED|DECATHLON|KIABI|\bACTION\b(?! LOGEMENT)|CDISCOUNT|SHEIN|LEBONCOIN|ZARA|H ?& ?M|PRIMARK/, 'Shopping'],
-  [/LEROY|CASTORAMA|BRICO|WELDOM|JARDILAND|\bIKEA\b|CONFORAMA|\bBUT\b/, 'Maison'],
-  [/CINEMA|\bCINE\b|STEAM|PLAYSTATION|XBOX|NINTENDO|BOWLING|PARC|MUSEE|CONCERT|TICKETMASTER/, 'Loisirs'],
-  [/RETRAIT|\bDAB\b|\bGAB\b/, 'Retraits']
-];
-// Règles apprises : par compte (V1.4), sinon anciennes règles communes
-// (une rentrée a sa propre règle « +clé » : la CAF qui verse et la CAF qu'on paie ne se classent pas pareil)
-const sk = (key, montant) => (montant > 0 ? '+' : '') + key;
-function ruleOf(acc, lib, montant) {
-  const k = keyOf(lib), m = motifOf(lib), s = montant > 0 ? '+' + k : null;
-  return (s && DB.regles.find(x => x.compte === acc && x.motif === s)) || DB.regles.find(x => x.compte === acc && x.motif === k) || DB.regles.find(x => !x.compte && (x.motif === k || x.motif === m));
-}
-function guessCat(lib, montant, acc) {
-  acc = acc || UI.acc;
-  const sr = seuilRule(acc, lib); if (sr) return resolveCat(acc, Math.abs(num(montant) || 0) > num(sr.s) ? sr.haut : sr.bas);
-  return resolveCat(acc, guessCat0(lib, montant, acc));
-}
-function guessCat0(lib, montant, acc) {
-  const r = ruleOf(acc || UI.acc, lib, montant); if (r && r.categorie) return r.categorie;
-  const N = NORM(lib), d = dico(N);
-  if (d) return montant > 0 && d[3] !== undefined ? d[3] : d[2]; // un remboursement reste dans la catégorie du marchand
-  if (montant > 0) return /\bVIR|REMISE|REM CHQ/.test(N) ? 'Revenus' : '';
-  for (const [re, c] of AUTO) if (re.test(N)) return c;
-  return '';
-}
-// Nom affiché d'une opération (importée : nom appris, sinon nom proposé ; saisie à la main : son libellé)
+
+/* ================= Classement et apprentissage (V3) =================
+   1er cycle suivi : tout arrive dans « À classer ». Ensuite, une opération n'est classée seule que si c'est sûr :
+   - revenu du cycle (salaire / virement de début de cycle) : même marchand, montant à ± 25 % ;
+   - charge fixe : même marchand qu'un fixe, montant à ± 10 % (3 € mini), jour à ± 4, pas encore vue dans le cycle ;
+   - ponctuel : marchand toujours classé dans la même catégorie (ou séparé par montant) ;
+   - prévue : même montant (± 1 %) à ± 4 jours.
+   Sinon elle reste « À classer », avec une suggestion. Onglet Apprentissage : cle = marchand (« + » devant pour une rentrée),
+   type = ponct | sal | ask (toujours demander), categorie (« A|B » si classé dans deux catégories), nom, montant. */
+const skOf = o => ((num(o.montant) || 0) > 0 ? '+' : '') + keyOf(o.libelle || '');
+const ruleOf3 = (acc, key) => DB.apprentissage.find(r => r.compte === acc && r.cle === key);
+function seuilRule(acc, key) { try { return JSON.parse(param('seuilCat|' + acc + '|' + key, 'null')); } catch (e) { return null; } }
 function nameOf(o) {
-  if (!o.ref) return o.libelle || o.categorie || '';
-  const r = ruleOf(o.compte, o.libelle, num(o.montant)); return (r && r.nom) || smartName(o.libelle);
+  if (o.nom) return o.nom;
+  if (!o.ref) return o.libelle || o.categorie || 'Opération';
+  const r = ruleOf3(o.compte, skOf(o)); return (r && r.nom) || smartName(o.libelle);
 }
-// Virement entre ses propres comptes (épargne, livret, autre banque à son nom)
-function isInternal(lib, acc) {
-  const N = NORM(lib), me = NORM(pname(ME)).trim(), perso = !!accOf(acc || UI.acc).proprietaire;
-  return /EPARGNE|\bLIVRET|\bLDD\b|\bLEP\b|\bPEL\b|\bCEL\b|ASSURANCE VIE|\bPEA\b|ARRONDI/.test(N) || (perso && isVIR(N) && me.length > 2 && new RegExp('\\b' + me + '\\b').test(N) && !/SALAIRE/.test(N));
-}
-function parseAmount(v) {
-  let s = String(v == null ? '' : v).replace(/[ \s€]|EUR/gi, '').replace(/^\+/, '');
-  if (!s) return null;
-  let neg = false;
-  if (/^\(.*\)$/.test(s)) { neg = true; s = s.slice(1, -1); }
-  if (/-$/.test(s)) { neg = true; s = s.slice(0, -1); }
-  if (s.includes(',') && s.includes('.')) s = s.lastIndexOf(',') > s.lastIndexOf('.') ? s.replace(/\./g, '').replace(',', '.') : s.replace(/,/g, '');
-  else if (s.includes(',')) s = s.replace(',', '.');
-  if (!/^-?\d+(\.\d+)?$/.test(s)) return null;
-  const n = parseFloat(s); return neg ? -Math.abs(n) : n;
-}
-function parseDate(v) {
-  const s = String(v || '').trim();
-  let m = /^(\d{4})-?(\d{2})-?(\d{2})/.exec(s);
-  if (m && +m[2] >= 1 && +m[2] <= 12) return `${m[1]}-${m[2]}-${m[3]}`;
-  m = /^(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{2,4})/.exec(s);
-  if (m) { const y = m[3].length === 2 ? '20' + m[3] : m[3]; if (+m[2] >= 1 && +m[2] <= 12 && +m[1] >= 1 && +m[1] <= 31) return `${y}-${pad(+m[2])}-${pad(+m[1])}`; }
+// Suggestion pour une opération : { kind: 'fixe'|'sal'|'ponct'|'ask', sure, why, r, cats }
+function suggest(o) {
+  const acc = o.compte, key = skOf(o), k0 = keyOf(o.libelle || ''), v = num(o.montant) || 0, a = Math.abs(v), neg = v < 0;
+  const rule = ruleOf3(acc, key);
+  if (rule && rule.type === 'ask') return { kind: 'ask', sure: false, why: 'Toujours demander pour ce marchand' };
+  if (!neg) { // prime versée à part (½ 13ème mois…) : montant à ± 10 %, date à ± 4 jours
+    const pp = primeParts(acc, addD(o.date, -4), addD(o.date, 4)).find(p => Math.abs(a - p.v) <= 0.1 * p.v && !allMovs().some(x => x.id !== o.id && x.lien === p.key));
+    if (pp) return { kind: 'prime', p: pp, sure: true, why: '' };
+  }
+  if (!neg && rule && rule.type === 'sal') {
+    const c = cycleByMois(acc, labelMonth(o.date)), exp = c ? c.montant : (num(rule.montant) || a);
+    const ok = Math.abs(a - exp) <= 0.1 * exp || (!(c && (c.detail.rappel || c.detail.primes.length)) && Math.abs(a - (num(rule.montant) || exp)) <= 0.25 * (num(rule.montant) || exp));
+    return { kind: 'sal', sure: ok, why: ok ? '' : `Montant inhabituel (attendu ${eur(exp)})` };
+  }
+  if (rule && rule.type === 'epargne' && livOf(rule.categorie)) return { kind: 'epargne', livret: rule.categorie, sure: true, why: '' };
+  const recs = DB.recurrents.filter(r => r.compte === acc && bool(r.actif) && (r.sens === '+') === !neg && (r.motif === key || r.motif === k0));
+  if (recs.length) {
+    const c = cycleAt(acc, o.date), day = +String(o.date).slice(8, 10);
+    const cand = recs.map(r => {
+      const occ = c ? occDates(r, c.debut, c.fin) : [];
+      const seen = c ? allMovs().filter(x => x.id !== o.id && x.compte === acc && x.type === 'fixe' && x.lien === r.id && x.date >= c.debut && x.date <= c.fin).length : 0;
+      const m = num(r.montant) || 0, amtOk = Math.abs(a - m) <= Math.max(0.1 * m, 3), dayOk = dayGap(num(r.jour) || 1, day) <= 4, free = seen < Math.max(1, occ.length);
+      return { r, amtOk, dayOk, free, sc: (amtOk ? 4 : 0) + (free ? 2 : 0) + (dayOk ? 1 : 0), d: Math.abs(a - m) };
+    }).sort((x, y) => y.sc - x.sc || x.d - y.d)[0];
+    const sure = cand.amtOk && cand.dayOk && cand.free;
+    const why = !cand.amtOk ? `Montant inhabituel (d'habitude ${eur(num(cand.r.montant))})` : !cand.free ? 'Déjà vue dans ce cycle' : !cand.dayOk ? `Date inhabituelle (d'habitude le ${cand.r.jour})` : '';
+    return { kind: 'fixe', r: cand.r, sure, why };
+  }
+  if (!rule) { // nom d'un livret dans le libellé : versement (débit) ou retrait (crédit), à confirmer
+    const nl = NORM(o.libelle || ''), L = livretsOf(acc).find(x => x.nom && nl.includes(NORM(x.nom)));
+    if (L) return { kind: 'epargne', livret: L.id, sure: false, why: '' };
+  }
+  const sr = neg && seuilRule(acc, k0);
+  if (sr) return { kind: 'ponct', cats: [a > num(sr.s) ? sr.haut : sr.bas], sure: true, why: '' };
+  if (rule && rule.type === 'ponct') {
+    const cats = String(rule.categorie || '').split('|').filter(Boolean);
+    return { kind: 'ponct', cats, sure: cats.length === 1, why: cats.length > 1 ? `Déjà classé en ${cats.join(' et en ')} : lequel ?` : '' };
+  }
   return null;
 }
-function parseOFX(t) {
-  const tx = [];
-  t.split(/<STMTTRN>/i).slice(1).forEach(b => {
-    const g = tag => { const m = new RegExp('<' + tag + '>([^<\\r\\n]*)', 'i').exec(b); return m ? m[1].trim() : ''; };
-    const d = parseDate(g('DTPOSTED').slice(0, 8)), a = parseAmount(g('TRNAMT'));
-    if (d && a !== null) tx.push({ date: d, montant: a, libelle: [g('NAME'), g('MEMO')].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim() });
-  });
-  const lb = /<LEDGERBAL>[\s\S]*?<BALAMT>([^<\r\n]+)[\s\S]*?<DTASOF>(\d{8})/i.exec(t);
-  return { tx, solde: lb && parseAmount(lb[1]) !== null ? { montant: parseAmount(lb[1]), date: parseDate(lb[2]) } : null, format: 'OFX' };
-}
-function parseCSV(t) {
-  const lines = t.split(/\r?\n/).filter(l => l.trim());
-  const sep = [';', '\t', ',', '|'].map(c => [c, lines.slice(0, 40).reduce((a, l) => a + (l.split(c).length - 1), 0)]).sort((a, b) => b[1] - a[1])[0][0];
-  const split = l => { const out = []; let cur = '', q = false; for (let i = 0; i < l.length; i++) { const ch = l[i]; if (ch === '"') { if (q && l[i + 1] === '"') { cur += '"'; i++; } else q = !q; continue; } if (ch === sep && !q) { out.push(cur); cur = ''; continue; } cur += ch; } out.push(cur); return out.map(x => x.trim()); };
-  const rows = lines.map(split);
-  const find = (h, re, not) => h.findIndex(x => re.test(x) && !(not && not.test(x)));
-  let hi = -1, c = {};
-  for (let i = 0; i < Math.min(rows.length, 40); i++) {
-    const h = rows[i].map(NORM);
-    const date = (() => { let k = find(h, /DATE.*(OPE|COMPTA)/); if (k < 0) k = find(h, /^DATE|DATE$|^JOUR/, /VALEUR/); return k; })();
-    const montant = find(h, /^MONTANT|AMOUNT|^SOMME/), debit = find(h, /DEBIT/), credit = find(h, /CREDIT/);
-    if (date >= 0 && (montant >= 0 || debit >= 0 || credit >= 0)) {
-      c = { date, montant, debit, credit, solde: find(h, /SOLDE|BALANCE/), lib: find(h, /LIBELLE|DESCRIPTION|INTITULE|DETAIL|LABEL|NATURE|OPERATION|BENEFICIAIRE/, /DATE|MONTANT|TYPE/) };
-      hi = i; break;
-    }
-  }
-  if (hi < 0) { // sans en-tête : on devine
-    const sample = rows.slice(0, 20);
-    const nc = Math.max(...sample.map(r => r.length));
-    const score = (k, f) => sample.filter(r => f(r[k])).length;
-    const cols = Array.from({ length: nc }, (_, k) => k);
-    c.date = cols.find(k => score(k, parseDate) > sample.length * 0.6);
-    const numc = cols.filter(k => k !== c.date && score(k, v => parseAmount(v) !== null && /\d/.test(v || '')) > sample.length * 0.5);
-    if (c.date === undefined || !numc.length) throw new Error('Colonnes non reconnues');
-    c.montant = numc[0]; c.debit = -1; c.credit = -1; c.solde = numc.length > 1 ? numc[numc.length - 1] : -1;
-    c.lib = cols.filter(k => k !== c.date && !numc.includes(k)).sort((a, b) => score(b, v => (v || '').length > 6) - score(a, v => (v || '').length > 6))[0];
-  }
-  const tx = []; let soldeRow = null;
-  rows.slice(hi + 1).forEach(r => {
-    const d = parseDate(r[c.date]); if (!d) return;
-    let a = c.montant >= 0 ? parseAmount(r[c.montant]) : null;
-    if (a === null) { const de = c.debit >= 0 ? parseAmount(r[c.debit]) : null, cr = c.credit >= 0 ? parseAmount(r[c.credit]) : null; if (de === null && cr === null) return; a = (cr ? Math.abs(cr) : 0) - (de ? Math.abs(de) : 0); }
-    const t2 = { date: d, montant: a, libelle: (c.lib >= 0 ? r[c.lib] : '') || r.filter((x, k) => k !== c.date && parseAmount(x) === null).join(' ') };
-    tx.push(t2);
-    if (c.solde >= 0) { const sv = parseAmount(r[c.solde]); if (sv !== null && (!soldeRow || d >= soldeRow.date)) soldeRow = { montant: sv, date: d }; }
-  });
-  if (!soldeRow) { // « Solde au 25/10/2026 : 1 482,25 » dans l'en-tête
-    for (const l of lines.slice(0, Math.max(hi, 0) + 1)) { const m = /SOLDE[^0-9-]*(\d{1,2}[\/.-]\d{1,2}[\/.-]\d{2,4})?[^0-9-]*(-?[\d\s.,]+\d)/i.exec(NORM(l)); if (m && parseAmount(m[2]) !== null) { soldeRow = { montant: parseAmount(m[2]), date: parseDate(m[1]) }; break; } }
-  }
-  return { tx, solde: soldeRow, format: 'CSV' };
-}
-function readImportFile(file) {
-  return file.arrayBuffer().then(buf => {
-    let t; try { t = new TextDecoder('utf-8', { fatal: true }).decode(buf); } catch (e) { t = new TextDecoder('windows-1252').decode(buf); }
-    t = t.replace(/^﻿/, '');
-    const p = /<OFX>|OFXHEADER|<STMTTRN>/i.test(t) ? parseOFX(t) : parseCSV(t);
-    if (!p.tx.length) throw new Error('Aucune opération trouvée dans ce fichier');
-    return p;
-  });
-}
-const refOf = t => t.date + '|' + r2(t.montant) + '|' + motifOf(t.libelle);
-const dayGap = (a, b) => { const d = Math.abs(a - b); return Math.min(d, 31 - d); }; // le 30 et le 1er sont voisins
-// Prélèvement fixe ou virement lié correspondant à une opération du relevé
-function matchFixed(t, acc, used) {
-  const k = t.date.slice(0, 7), d = +t.date.slice(8, 10), a = Math.abs(t.montant), neg = t.montant < 0;
-  const near = (m, j) => Math.abs((num(m) || 0) - a) <= Math.max(0.15 * (num(m) || 0), 5) && dayGap(num(j) || 1, d) <= 4;
-  const free = key => !used.has(k + '|' + key);
-  const same = m => m && (m === t.motif || m === t.key);
-  const ok = f => Math.abs((num(f.montant) || 0) - a) <= Math.max(0.5 * (num(f.montant) || 0), 20); // même libellé : montant du même ordre
-  const best = list => list.sort((x, y) => Math.abs((num(x.montant) || 0) - a) - Math.abs((num(y.montant) || 0) - a))[0];
-  const fx = DB.fixes.filter(f => f.compte === acc && occursF(f, k) && (f.sens === '+') !== neg && free('f' + f.id));
-  // banque : le libellé peut différer de celui des relevés ; on accepte alors une charge au montant très proche, à la bonne date
-  const bankNear = f => t.bank && Math.abs((num(f.montant) || 0) - a) <= Math.max(0.1 * (num(f.montant) || 0), 2) && dayGap(num(f.jour) || 1, d) <= 4;
-  const f = best(fx.filter(f => same(f.motif) && ok(f))) || best(fx.filter(f => !f.motif && near(f.montant, f.jour))) || best(fx.filter(bankNear));
-  if (f) return 'f' + f.id;
-  const vx = DB.virements.filter(v => occursV(v, k) && ((v.de === acc && neg) || (v.vers === acc && !neg)) && free('v' + v.id));
-  const v = best(vx.filter(v => v.motif && v.de === acc && same(v.motif) && ok(v))) || best(vx.filter(v => !(v.motif && v.de === acc) && near(v.montant, v.jour)));
-  return v ? 'v' + v.id : null;
-}
-// Jour « médian » sur un cercle (le 30 et le 1er sont proches) et écart maximal
-// (fenêtre de 8 jours qui couvre le plus d'occurrences : un mois décalé ne fait pas tout rejeter)
-function circDays(days) {
-  let best = null;
-  days.forEach(start => { const rel = days.map(d => (d - start + 31) % 31).filter(x => x <= 8).sort((a, b) => a - b); if (!best || rel.length > best.rel.length) best = { start, rel }; });
-  const mid = best.rel[Math.floor(best.rel.length / 2)];
-  return { cover: best.rel.length / days.length, jour: ((best.start + mid - 1) % 31) + 1 };
-}
-// Opérations qui reviennent chaque mois : même marchand, montant du même ordre, même période du mois
-function detectRecurring(tx, acc) {
-  const months = [...new Set(tx.map(t => t.date.slice(0, 7)))].sort(), span = months.length;
-  if (span < 2) return [];
-  const groups = {};
-  tx.forEach(t => { const k = (t.montant < 0 ? '-' : '+') + t.key; (groups[k] = groups[k] || []).push(t); });
-  const commun = accOf(acc).proprietaire ? accs().find(a => !a.proprietaire) : null;
-  const out = [];
-  Object.values(groups).forEach(all => {
-    // un même libellé peut cacher plusieurs flux (deux prêts, salaire + remboursements de frais) : on sépare par montant
-    const srt = all.slice().sort((a, b) => Math.abs(a.montant) - Math.abs(b.montant)), clusters = [];
-    const cb = isCB(NORM(all[0].libelle)); // carte : on ne regroupe que les montants quasi identiques (abonnements)
-    srt.forEach(t => { const c = clusters[clusters.length - 1], a = Math.abs(t.montant), p = c && Math.abs(c[c.length - 1].montant); if (c && a - p <= (cb ? Math.max(0.03 * p, 0.5) : Math.max(0.25 * p, 3))) c.push(t); else clusters.push([t]); });
-    const found = [];
-    clusters.forEach(g => {
-      g.sort((a, b) => a.date.localeCompare(b.date));
-      const ms = new Set(g.map(t => t.date.slice(0, 7))), mL = months[months.length - 1];
-      // présent quasiment chaque mois depuis sa première apparition (un abonnement récent compte) et toujours actif
-      const from = diffM(g[0].date.slice(0, 7), mL) + 1, lastOcc = g[g.length - 1].date.slice(0, 7);
-      if (ms.size < Math.min(3, span) || ms.size < 2 || ms.size < Math.ceil(from * 0.75) || lastOcc < addM(mL, -1) || g.length > ms.size * 1.5) return;
-      const amts = g.map(t => Math.abs(t.montant)).sort((a, b) => a - b), med = amts[Math.floor(amts.length / 2)];
-      const wide = amts[amts.length - 1] - amts[0] > Math.max(0.3 * med, 15);
-      if (wide && (ms.size < Math.ceil(from * 0.85) || g.length > ms.size * 1.2)) return; // montant très variable : seulement si quasi tous les mois, une fois
-      const N0 = NORM(g[0].libelle);
-      if (isCB(N0) && (amts[amts.length - 1] - amts[0] > Math.max(0.5, 0.02 * med) || g.length > ms.size * 1.1)) return; // carte : seulement un abonnement (montant quasi fixe, une fois par mois)
-      const cd = circDays(g.map(t => +t.date.slice(8, 10)));
-      if (cd.cover < 0.75) return;
-      const neg = g[0].montant < 0, last = g[g.length - 1];
-      found.push({ g, ms, amts, med, wide, cd, neg, last, N0 });
-    });
-    found.sort((a, b) => b.med - a.med).forEach((F, i) => {
-      const { g, ms, amts, med, wide, cd, neg, last, N0 } = F;
-      let nom = (ruleOf(acc, g[0].libelle, g[0].montant) || {}).nom || smartName(g[0].libelle);
-      if (!neg && med >= 900 && isVIR(N0) && accOf(acc).proprietaire && !/SALAIRE/.test(nom.toUpperCase()) && !isInternal(g[0].libelle, acc) && !dico(N0)) nom = 'Salaire (' + pretty(words(g[0].libelle).slice(0, 2).join(' ')) + ')';
-      else if (/\bLOYER\b/.test(N0)) nom = 'Loyer';
-      if (found.length > 1) nom += ' n°' + (i + 1);
-      out.push({ id: 'r' + out.length, motif: g[0].key, nom, montant: r2(wide ? med : Math.abs(last.montant)), sens: neg ? '-' : '+', jour: cd.jour,
-        cat: guessCat(g[0].libelle, g[0].montant, acc) || (neg ? 'Autre' : 'Revenus'), variable: amts[amts.length - 1] - amts[0] > 2 ? [amts[0], amts[amts.length - 1]] : null,
-        txs: g, months: ms.size, span, lib: g[0].libelle, vir: neg && isVIR(N0) && commun && !isInternal(g[0].libelle, acc) ? commun.id : null });
-    });
-  });
-  return out.sort((a, b) => (a.sens === b.sens ? 0 : a.sens === '+' ? -1 : 1) || b.montant - a.montant);
-}
-
-/* ----- Déroulé de l'import ----- */
-let IMP = null;
-// Effacer un compte pour repartir d'un relevé (profils, accès, catégories et noms appris sont gardés)
-function resetOps(acc) {
-  const ops = [], virs = DB.virements.filter(v => v.de === acc), vk = new Set(virs.map(v => 'v' + v.id));
-  DB.fixes.filter(f => f.compte === acc).forEach(f => ops.push(del('Fixes', f.id)));
-  virs.forEach(v => ops.push(del('Virements', v.id)));
-  const opsAcc = DB.operations.filter(o => o.compte === acc), liens = new Set(opsAcc.filter(o => o.type === 'vir' && o.lien).map(o => o.lien));
-  DB.operations.filter(o => o.compte === acc || (o.lien && liens.has(o.lien))).forEach(o => ops.push(del('Operations', o.id)));
-  DB.pointages.filter(p => p.compte === acc || vk.has(p.cle)).forEach(p => ops.push(del('Pointages', p.id)));
-  DB.clotures.filter(c => c.compte === acc).forEach(c => ops.push(del('Clotures', c.id)));
-  ops.push(upd('Comptes', { id: acc, soldeDepart: '', moisDepart: '' }));
+// Classement automatique d'une nouvelle opération (renvoie les écritures annexes : prévue réalisée, date du cycle)
+function autoClass(o) {
+  const acc = o.compte, v = num(o.montant) || 0, a = Math.abs(v), S = v3(acc) || {}, ops = [];
+  const pv = DB.prevues.find(p => p.compte === acc && !p.etat && Math.sign(num(p.montant) || 0) === Math.sign(v) && Math.abs(Math.abs(num(p.montant) || 0) - a) <= Math.max(0.01 * a, 1) && Math.abs(dDiff(p.date, o.date)) <= 4);
+  if (pv) { Object.assign(o, pv.livret ? { type: 'epargne', livret: pv.livret, categorie: pv.categorie || 'Épargne', nom: pv.libelle, auto: '1' } : { type: 'ponct', categorie: pv.categorie || '', nom: pv.libelle, auto: '1' }); ops.push(upd('Prevues', { id: pv.id, etat: 'realisee', lien: o.id })); return ops; }
+  const c = cycleAt(acc, o.date), s = suggest(o);
+  if (!s || !s.sure) return ops;
+  if (s.kind === 'prime') { Object.assign(o, { type: 'ponct', categorie: 'Primes', lien: s.p.key, nom: s.p.nom, auto: '1' }); return ops; }
+  // le revenu du cycle suivant peut arriver avant la date estimée : accepté dès 15 jours après le début du suivi
+  const allowed = (c && c.i >= 1) || (s.kind === 'sal' && S.debut && dDiff(S.debut, o.date) >= 15);
+  if (!allowed) return ops;
+  if (s.kind === 'sal') { Object.assign(o, { type: 'sal', lien: labelMonth(o.date), categorie: '', auto: '1' }); ops.push(...cycleDateOps(acc, o)); }
+  else if (s.kind === 'fixe') Object.assign(o, { type: 'fixe', lien: s.r.id, categorie: s.r.categorie || '', nom: s.r.libelle, auto: '1' });
+  else if (s.kind === 'ponct') { const r = ruleOf3(acc, skOf(o)); Object.assign(o, { type: 'ponct', categorie: s.cats[0], nom: (r && r.nom) || '', auto: '1' }); }
+  else if (s.kind === 'epargne') Object.assign(o, { type: 'epargne', livret: s.livret, categorie: 'Épargne', auto: '1' });
   return ops;
 }
-function startImport(parsed, mode, opt) {
-  opt = opt || {}; const acc = opt.acc || UI.acc;
-  if (started(acc) && !mode) { IMP = { acc, parsed, step: 'choice' }; UI.imp = 'go'; render(); scrollTo(0, 0); return; }
-  if (mode === 'reset') commit(resetOps(acc));
-  const first = !started(acc), used = new Set();
-  const tx = parsed.tx.slice().sort((a, b) => a.date.localeCompare(b.date));
+// Le revenu vu à la banque fixe la date de début (et le montant) du cycle, sauf si on les a saisis à la main
+function cycleDateOps(acc, o) {
+  const k = o.lien || labelMonth(o.date), S = v3(acc) || {}, id = acc + '|' + k;
+  const r = DB.cycles.find(x => x.id === id) || {}, man = String(r.manuel || ''), row = { id, compte: acc, mois: k };
+  if (k !== S.mois && !man.includes('d')) row.debut = o.date;
+  return Object.keys(row).length > 3 ? [upd('Cycles', row)] : [];
+}
+// Classement à la main (ou correction) : h = { type, categorie, nom, recId, newRec: {libelle, jour, montant}, ask }
+function classifyOps(o, h) {
+  const acc = o.compte, key = skOf(o), ops = [], v = num(o.montant) || 0;
+  const row = { id: o.id, type: h.type === 'prime' ? 'ponct' : h.type, categorie: h.categorie || '', lien: '', auto: '', nom: h.nom || '', livret: '' };
+  const rule = ruleOf3(acc, key), rid0 = rule ? rule.id : uid(), learn = f => ops.push(upd('Apprentissage', Object.assign({ id: rid0, compte: acc, cle: key }, rule ? {} : { type: '', categorie: '', nom: '', montant: '' }, f)));
+  if (h.type === 'fixe') {
+    let rid = h.recId;
+    if (!rid) {
+      rid = uid(); const c = cycleAt(acc, o.date);
+      ops.push(upd('Recurrents', { id: rid, compte: acc, libelle: h.newRec.libelle || nameOf(o), montant: r2(Math.abs(num(h.newRec.montant) || Math.abs(v))), sens: v > 0 ? '+' : '-', jour: num(h.newRec.jour) || +o.date.slice(8, 10), categorie: h.categorie || '', debut: c ? c.debut : o.date, fin: '', actif: 'oui', motif: key, livret: h.newRec.livret || '' }));
+      row.nom = h.newRec.libelle || nameOf(o);
+    } else {
+      const r = recOf(rid); if (r) { if (r.motif !== key) ops.push(upd('Recurrents', { id: rid, motif: key })); row.categorie = h.categorie || r.categorie || ''; row.nom = r.libelle; }
+    }
+    row.lien = rid;
+  } else if (h.type === 'epargne') {
+    row.livret = h.livret || ''; row.categorie = h.categorie || 'Épargne';
+    learn({ type: 'epargne', categorie: h.livret || '' });
+  } else if (h.type === 'prime') {
+    row.lien = h.key; row.categorie = 'Primes'; row.nom = h.nom || '';
+  } else if (h.type === 'sal') {
+    row.lien = labelMonth(o.date); row.categorie = '';
+    ops.push(...cycleDateOps(acc, Object.assign({}, o, { lien: row.lien })));
+    learn({ type: 'sal', montant: r2(Math.abs(v)) });
+  } else if (h.type === 'ponct') {
+    const cat = h.categorie || '';
+    const prev = rule && rule.type === 'ponct' ? String(rule.categorie || '').split('|').filter(Boolean) : [];
+    const cats = cat && !prev.includes(cat) ? prev.concat(cat) : prev.length ? prev : [cat].filter(Boolean);
+    const f = { type: 'ponct', categorie: cats.join('|') };
+    if (h.nom && h.nom !== smartName(o.libelle || '')) f.nom = h.nom;
+    learn(f);
+  }
+  if (h.ask !== undefined && (h.ask || (rule && rule.type === 'ask'))) learn({ type: h.ask ? 'ask' : (h.type === 'sal' ? 'sal' : 'ponct') });
+  if (h.categorie) ops.push(...newCatOps(acc, h.categorie));
+  ops.push(upd('Mouvements', row));
+  return ops;
+}
+// Catégorie absente de la liste : créée (sans budget)
+function newCatOps(acc, nom) {
+  nom = String(nom || '').trim(); if (!nom || budgetsOf(acc).some(b => b.nom.toLowerCase() === nom.toLowerCase())) return [];
+  return [upd('Budgets', { id: uid(), compte: acc, nom, budget: '', ordre: Math.max(0, ...budgetsOf(acc).map(b => num(b.ordre) || 0)) + 1 })];
+}
+
+/* ================= Lecture de la banque : nouvelles opérations ================= */
+// Écritures appliquées tout de suite en local (les suivantes en tiennent compte), envoyées en une fois
+function stage(ops) { clean(ops); QUEUE.push(...ops); store.set('le31-file', QUEUE); ops.forEach(applyLocal); CACHE = {}; }
+const lastBankDate = acc => DB.mouvements.filter(o => o.compte === acc && String(o.ref || '').startsWith('bk|')).reduce((m, o) => o.date > m ? o.date : m, '');
+function ingest(acc, tx, solde, st) {
+  const S = st || v3(acc), res = { n: 0, auto: 0, todo: 0, recal: 0 };
+  if (!S || !S.debut) return res;
+  const refs = new Set(DB.mouvements.filter(o => o.compte === acc && o.ref).map(o => o.ref));
+  const manual = DB.mouvements.filter(o => o.compte === acc && !o.ref && o.type !== 'ajust');
   const seen = {};
-  tx.forEach(t => { t.bank = parsed.format === 'Banque'; t.motif = motifOf(t.libelle); t.key = keyOf(t.libelle); t.ref = (t.bank ? 'bk|' : '') + refOf(t); seen[t.ref] = (seen[t.ref] || 0) + 1; if (seen[t.ref] > 1) t.ref += '#' + seen[t.ref]; });
-  const I = { acc, first, parsed, tx, recur: [], keep: {}, virOn: {}, gname: {}, gcat: {}, gtouch: {}, kind: {}, newCats: [], gshow: 30, solde: parsed.solde, recal: true, reset: mode === 'reset' };
-  if (first) {
-    const m0 = tx[0].date.slice(0, 7), mL = tx[tx.length - 1].date.slice(0, 7);
-    I.mois = +tx[0].date.slice(8, 10) <= 3 || m0 === mL ? m0 : addM(m0, 1);
-  } else I.mois = startMonth(acc);
-  I.kept = tx.filter(t => t.date.slice(0, 7) >= I.mois && t.date <= TODAY_ISO.slice(0, 7) + '-31');
-  // déjà connus : prélèvements fixes / virements liés, opérations déjà importées ou saisies à la main
-  const refs = new Set(DB.operations.filter(o => o.compte === acc && o.ref).map(o => o.ref));
-  const manual = DB.operations.filter(o => o.compte === acc && !o.ref && o.type !== 'ajust');
-  // banque : une opération déjà importée d'un relevé (même jour, même montant) peut avoir un libellé un peu différent
-  const dayAmt = {}; if (parsed.format === 'Banque') DB.operations.filter(o => o.compte === acc && o.ref && !String(o.ref).startsWith('bk|')).forEach(o => { const k = o.date + '|' + r2(num(o.montant)); dayAmt[k] = (dayAmt[k] || 0) + 1; });
-  I.kept.forEach(t => {
-    if (refs.has(t.ref)) { t.dup = true; return; }
-    const da = t.date + '|' + r2(t.montant); if (dayAmt[da]) { dayAmt[da]--; t.dup = true; return; }
-    const m = matchFixed(t, acc, used);
-    if (m) { used.add(t.date.slice(0, 7) + '|' + m); if (point(t.date.slice(0, 7), m)) t.dup = true; else t.match = m; return; } // déjà pointé = déjà compté
-    const mo = manual.find(o => Math.abs((num(o.montant) || 0) - t.montant) < 0.01 && Math.abs(new Date(o.date) - new Date(t.date)) <= 4 * 864e5);
-    if (mo) { t.same = mo.id; manual.splice(manual.indexOf(mo), 1); }
+  tx.filter(t => t.date >= S.debut).sort((x, y) => x.date.localeCompare(y.date)).forEach(t => {
+    let ref = 'bk|' + t.date + '|' + r2(t.montant) + '|' + motifOf(t.libelle); seen[ref] = (seen[ref] || 0) + 1; if (seen[ref] > 1) ref += '#' + seen[ref];
+    if (refs.has(ref)) return;
+    // saisie à la main déjà là (même montant à ± 4 jours) : c'est la même opération
+    const mo = manual.find(x => Math.abs((num(x.montant) || 0) - t.montant) < 0.01 && Math.abs(dDiff(x.date, t.date)) <= 4);
+    if (mo) { manual.splice(manual.indexOf(mo), 1); stage([upd('Mouvements', { id: mo.id, ref, date: t.date })]); return; }
+    const o = { id: uid(), compte: acc, date: t.date, montant: r2(t.montant), libelle: String(t.libelle || '').slice(0, 120), nom: '', categorie: '', type: '', lien: '', auto: '', ref, profil: ME || '', livret: '' };
+    const extra = st ? [] : autoClass(o);
+    stage([upd('Mouvements', o)].concat(extra));
+    res.n++; if (o.auto) res.auto++; if (!o.type) res.todo++;
   });
-  if (first) { I.recur = detectRecurring(tx.filter(t => !t.match && !t.dup), acc); /* déjà pointé (virement lié importé de l'autre côté) : pas une nouvelle charge */ I.recur.forEach(r => { I.keep[r.id] = true; if (r.vir) I.virOn[r.id] = true; }); }
-  // gros mouvements et virements entre ses comptes
-  impRest(I).forEach(t => {
-    const r = ruleOf(acc, t.libelle, t.montant), a = Math.abs(t.montant);
-    if (r && (r.type === 'int' || r.type === 'exc')) { I.kind[t.ref] = r.type; t.big = r.type === 'int' || a >= 800; return; }
-    if (isInternal(t.libelle, acc)) { I.kind[t.ref] = 'int'; t.big = true; }
-    else if (a >= 800) { I.kind[t.ref] = a >= 1500 || /DEBLOCAGE/.test(NORM(t.libelle)) ? 'exc' : 'norm'; t.big = true; }
-  });
-  I.steps = [first && I.recur.length ? 'recur' : '', 'big', 'groups', first ? 'solde' : ''].filter(Boolean);
-  I.step = I.steps[0];
-  if (opt.silent) return I;
-  IMP = I; UI.imp = 'go'; render(); scrollTo(0, 0);
-}
-// opérations à créer (hors prélèvements reconnus et doublons)
-function impRest(I) {
-  const inRecur = new Set(); if (I.first) I.recur.filter(r => I.keep[r.id]).forEach(r => r.txs.forEach(t => inRecur.add(t)));
-  return I.kept.filter(t => !t.dup && !t.match && !t.same && !inRecur.has(t));
-}
-const gk = t => sk(t.key, t.montant);
-const impCat = (I, t) => gk(t) in I.gcat ? I.gcat[gk(t)] : guessCat(t.libelle, t.montant, I.acc) || (I.kind[t.ref] === 'int' ? 'Entre mes comptes' : '');
-const impName = (I, t) => I.gname[gk(t)] || (ruleOf(I.acc, t.libelle, t.montant) || {}).nom || smartName(t.libelle);
-// groupes par marchand (et par sens : dépense / rentrée)
-function impGroups(I) {
-  const g = {};
-  impRest(I).forEach(t => { const k = gk(t); (g[k] = g[k] || { key: k, txs: [], tot: 0 }); g[k].txs.push(t); g[k].tot += t.montant; });
-  return Object.values(g).map(x => Object.assign(x, { cat: impCat(I, x.txs[0]), nom: impName(I, x.txs[0]), lib: x.txs[x.txs.length - 1].libelle }))
-    .sort((a, b) => (a.cat ? 1 : 0) - (b.cat ? 1 : 0) || Math.abs(b.tot) - Math.abs(a.tot));
-}
-const impCats = I => { const s = new Set(catsOf(I.acc).map(c => c.nom).concat(I.newCats)); impRest(I).forEach(t => { const c = impCat(I, t); if (c) s.add(c); }); return [...s]; };
-function impNext(I) { const s = I.steps || [], i = s.indexOf(I.step); return s[i + 1] || 'go'; }
-function impPrev(I) { const s = I.steps || [], i = s.indexOf(I.step); return i > 0 ? s[i - 1] : ''; }
-function vImport() {
-  const I = IMP, A = accOf(I.acc);
-  const close = `<button class="btn ghost small" data-impclose="1">Annuler</button>`;
-  const top = (t, sub) => `${I.steps ? `<div class="steps">${I.steps.map((s, i) => `<i class="${i <= I.steps.indexOf(I.step) ? 'on' : ''}"></i>`).join('')}</div>` : ''}<div class="rowhead"><h2 style="font-size:20px">${t}</h2>${close}</div>${sub ? `<p class="hint" style="font-size:14px;margin:0">${sub}</p>` : ''}`;
-  const back = impPrev(I) ? `<button class="btn ghost" data-impstep="${impPrev(I)}">Retour</button>` : '';
-  const nextBtn = label => `<div class="actions">${back}<button class="btn" data-impstep="${impNext(I)}">${label}</button></div>`;
-  if (I.step === 'choice') {
-    const n = DB.operations.filter(o => o.compte === I.acc && o.ref).length;
-    return `<section class="view">${top('Importer dans ' + esc(A.nom), `${I.parsed.format} · ${I.parsed.tx.length} opérations.`)}
-      <button class="choice" data-impmode="add"><b>Ajouter les nouvelles opérations</b><span>Le compte garde tout ce qu'il a. Les opérations déjà présentes sont ignorées, les prélèvements se pointent tout seuls.</span></button>
-      <button class="choice" data-impmode="reset"><b>Tout refaire à partir de ce relevé</b><span>Le compte est vidé (charges fixes, opérations${n ? ` dont ${n} importées` : ''}, clôtures${DB.virements.some(v => v.de === I.acc) ? ', virements liés partant de ce compte' : ''}) puis reconstruit avec ce relevé. Profils, accès, catégories et noms appris sont gardés.</span></button>
-      <div class="note">« Tout refaire » est conseillé si le compte a été importé avec une version avant la V1.4.</div></section>`;
-  }
-  const span = `${I.parsed.format} · ${I.tx.length} opérations · du ${I.tx[0].date.split('-').reverse().join('/')} au ${I.tx[I.tx.length - 1].date.split('-').reverse().join('/')}`;
-  if (I.step === 'recur') {
-    const nRec = I.recur.filter(r => I.keep[r.id]).length;
-    return `<section class="view">${top(`${I.recur.length} opération${I.recur.length > 1 ? 's' : ''} qui revien${I.recur.length > 1 ? 'nent' : 't'} chaque mois`, `${span}. Pour chacune : est-ce une <b>charge fixe</b> (ou un revenu fixe) ? Le nom proposé se modifie.`)}
-    <div class="list">${I.recur.map(r => `<div class="rec ${I.keep[r.id] ? '' : 'off'}">
-      <div class="rl"><input class="nm" data-rname="${r.id}" value="${esc(r.nom)}" aria-label="Nom">
-        <div class="raw">${esc(r.lib.slice(0, 60))}</div>
-        <div class="mini">le ${r.jour} · ${esc(r.cat)} · ${r.months}/${r.span} mois${r.variable ? ` · <span class="tag w">variable ${eur0(r.variable[0])} à ${eur0(r.variable[1])}</span>` : ''}</div>
-        ${r.vir ? `<label class="mini" style="display:flex;gap:6px;align-items:center"><input type="checkbox" data-rvir="${r.id}" ${I.virOn[r.id] ? 'checked' : ''} style="width:18px;height:18px"> Virement lié vers ${esc(accName(r.vir))}</label>` : ''}</div>
-      <div class="rr"><span class="amt ${r.sens === '+' ? 'pos' : 'neg'}">${r.sens === '+' ? '+' : '−'}${eur(r.montant)}${r.variable ? '<small>moyenne</small>' : ''}</span>
-        <div class="yn"><button class="y" data-rkeep="${r.id}" data-v="1" aria-pressed="${!!I.keep[r.id]}">Fixe</button><button class="n" data-rkeep="${r.id}" data-v="0" aria-pressed="${!I.keep[r.id]}">Non</button></div></div></div>`).join('')}</div>
-    ${I.recur.some(r => r.vir) ? `<div class="note">Un <b>virement lié</b> apparaît aussi sur le compte commun : il n'est compté qu'une fois, même si le relevé du commun a déjà été importé.</div>` : ''}
-    <div class="hint">Les opérations « Non » rejoignent les opérations ponctuelles à l'étape suivante.</div>
-    ${nextBtn(`Ajouter ${nRec} charge${nRec > 1 ? 's' : ''} fixe${nRec > 1 ? 's' : ''} · continuer`)}</section>`;
-  }
-  if (I.step === 'big') {
-    const big = impRest(I).filter(t => t.big).sort((a, b) => Math.abs(b.montant) - Math.abs(a.montant));
-    if (!big.length) { I.step = impNext(I); if (I.step === 'go') { setTimeout(commitImport); return '<section class="view"><p class="hint">Import…</p></section>'; } return vImport(); }
-    return `<section class="view">${top('Gros mouvements et virements entre tes comptes', 'Ils fausseraient tes habitudes de dépenses. Comment les compter ?')}
-    <div class="list">${big.map(t => `<div class="rec"><div class="rl"><b>${esc(impName(I, t))}</b><div class="raw">${t.date.split('-').reverse().join('/')} · ${esc(t.libelle.slice(0, 60))}</div>
-      <div class="chips">${[['exc', 'Exceptionnel'], ['int', 'Entre mes comptes'], ['norm', 'Normal']].map(([k, l]) => `<button class="chip" data-bigk="${esc(t.ref)}" data-k="${k}" aria-pressed="${I.kind[t.ref] === k}">${l}</button>`).join('')}</div></div>
-      <div class="rr"><span class="amt ${t.montant > 0 ? 'pos' : 'neg'}">${sgn(t.montant)}</span></div></div>`).join('')}</div>
-    <div class="note"><b>Exceptionnel</b> : compté dans le solde, mais pas dans les habitudes ni les prévisions (achat de voiture, travaux, prime…).<br><b>Entre mes comptes</b> : épargne, livret, autre compte à toi. Ni dépense ni revenu. Retenu pour les prochains imports.</div>
-    ${nextBtn('Continuer')}</section>`;
-  }
-  if (I.step === 'groups') {
-    const G = impGroups(I), cats = impCats(I), nc = G.filter(g => !g.cat).length, n = impRest(I).length;
-    if (!G.length) { I.step = impNext(I); if (I.step === 'go') { setTimeout(commitImport); return '<section class="view"><p class="hint">Import…</p></section>'; } return vImport(); }
-    const q = NORM(I.q || ''), list = q ? G.filter(g => NORM(g.nom + ' ' + g.lib).includes(q)) : G, shown = list.slice(0, I.gshow);
-    const known = I.kept.filter(t => t.dup || t.same).length, pts = I.kept.filter(t => t.match).length;
-    return `<section class="view">${top(I.first ? 'Toutes les autres opérations' : 'Nouvelles opérations', `${n} opération${n > 1 ? 's' : ''} en ${G.length} groupe${G.length > 1 ? 's' : ''} par marchand${nc ? `, dont <b>${nc} à classer</b>` : ''}. Corrige seulement ce qui ne va pas : ton choix s'applique à tout le groupe et sert aux prochains imports.`)}
-    ${!I.first ? `<div class="kv"><div><small>Nouvelles opérations</small><b>${n}</b></div><div><small>Prélèvements pointés</small><b>${pts}</b></div></div>${known ? `<div class="hint">${known} opération(s) déjà présente(s) ignorée(s) : pas de doublon.</div>` : ''}` : ''}
-    <div class="search"><input id="impQ" placeholder="Rechercher un libellé…" value="${esc(I.q || '')}" aria-label="Rechercher" autocomplete="off"></div>
-    <div class="list">${shown.map(g => `<div class="rec"><div class="rl">
-        <input class="nm" data-gname="${esc(g.key)}" value="${esc(g.nom)}" aria-label="Nom">
-        <div class="raw">${esc(g.lib.slice(0, 60))} · ${g.txs.length} opération${g.txs.length > 1 ? 's' : ''}</div>
-        ${I.creating === g.key ? `<div class="inline"><input id="newCatIn" placeholder="Ex. Véhicule > Garage" autocomplete="off" style="flex:1;min-width:0"><button class="btn small" data-gnewok="${esc(g.key)}">Créer</button></div>`
-        : `<select data-gcat="${esc(g.key)}" aria-label="Catégorie" class="${g.cat ? '' : 'todo'}"><option value="" ${g.cat ? '' : 'selected'}>À classer…</option>${cats.map(c => `<option ${c === g.cat ? 'selected' : ''}>${esc(c)}</option>`).join('')}<option value="__new">＋ Nouvelle catégorie…</option></select>`}
-      </div><div class="rr"><span class="amt ${g.tot > 0 ? 'pos' : 'neg'}">${sgn(r2(g.tot))}</span>${g.txs.length > 1 ? '<small class="mini">au total</small>' : ''}</div></div>`).join('') || '<div class="empty">Aucun résultat.</div>'}
-      ${list.length > shown.length ? `<button class="item" data-gmore="1" style="grid-template-columns:1fr;text-align:center;color:var(--accent);font-weight:700">Afficher ${Math.min(30, list.length - shown.length)} de plus (${list.length - shown.length} restants)</button>` : ''}</div>
-    <div class="hint">Ce qui reste « à classer » pourra l'être plus tard dans l'onglet <b>Ponctuel</b>.</div>
-    ${!I.first && I.solde ? (() => { const d = soldeDelta(I); return Math.abs(d.delta) >= 1 ? `<label class="switch" for="recal"><span>Recaler le solde sur le relevé (${eur(I.solde.montant)} au ${I.solde.date.split('-').reverse().join('/')}, écart ${sgn(r2(d.delta))})</span><input type="checkbox" id="recal" data-recal="1" ${I.recal ? 'checked' : ''}></label>` : ''; })() : ''}
-    ${nextBtn(I.first ? 'Continuer' : 'Importer')}</section>`;
-  }
-  if (I.step === 'solde') return `<section class="view">${top('Solde du compte', '')}
-    ${I.solde ? `<div class="hero"><span class="sub">Solde lu dans le relevé au ${I.solde.date.split('-').reverse().join('/')}</span><div class="big num">${eur(I.solde.montant)}</div>
-      <div class="hint">Si ce n'est pas le bon, corrige-le :</div><div class="amountbox"><input id="impSolde" inputmode="decimal" value="${fr(I.solde.montant)}" aria-label="Solde"><span>€</span></div></div>`
-    : `<div class="hero"><div class="hint" style="font-size:14px">Le fichier n'indique pas le solde. Indique le solde affiché par la banque à la date de la dernière opération du relevé (${I.tx[I.tx.length - 1].date.split('-').reverse().join('/')}).</div><div class="amountbox"><input id="impSolde" inputmode="decimal" placeholder="0,00" aria-label="Solde"><span>€</span></div></div>`}
-    <div class="note">Le 31 démarre le compte au <b>1er ${mLabel(I.mois)}</b>, recalcule chaque mois passé et les clôture automatiquement.</div>
-    <div class="actions">${back}<button class="btn" data-impstep="go">Créer le compte</button></div></section>`;
-  const R = I.result || {};
-  return `<section class="view"><h2 style="font-size:22px">${I.first ? 'Compte prêt' : 'Relevé importé'}</h2>
-    <div class="hero"><div class="kv"><div><small>Opérations ajoutées</small><b>${R.ops || 0}</b></div><div><small>${I.first ? 'Charges fixes créées' : 'Prélèvements pointés'}</small><b>${I.first ? R.fixes || 0 : R.pts || 0}</b></div></div>
-    ${R.exc ? `<div class="hint">${R.exc} mouvement${R.exc > 1 ? 's' : ''} exceptionnel${R.exc > 1 ? 's' : ''} ou entre tes comptes, hors habitudes.</div>` : ''}
-    ${R.nc ? `<div class="hint">${R.nc} opération${R.nc > 1 ? 's' : ''} à classer : onglet <b>Ponctuel</b>, filtre « À classer ».</div>` : ''}
-    ${R.dbl ? `<div class="note good">${R.dbl} rentrée${R.dbl > 1 ? 's' : ''} fixe${R.dbl > 1 ? 's' : ''} du compte commun remplacée${R.dbl > 1 ? 's' : ''} par le virement lié correspondant : plus de doublon.</div>` : ''}
-    ${I.first ? `<div class="note good">Les habitudes sont calculées sur les dépenses courantes${R.clos ? ` et ${R.clos} mois passé${R.clos > 1 ? 's sont clôturés' : ' est clôturé'}` : ''}.</div>` : ''}
-    ${R.recal ? `<div class="note">Solde recalé de ${sgn(R.recal)}.</div>` : ''}
-    <div class="hint">Pour la suite : importe un nouveau relevé quand tu veux (bouton « Importer un relevé » dans l'onglet Mois). Les doublons sont ignorés et les prélèvements se pointent tout seuls.</div></div>
-    <button class="btn" data-impclose="1">Voir le mois</button></section>`;
-}
-// écart entre le solde calculé par l'appli et le solde du relevé
-function soldeDelta(I) {
-  const d = I.solde.date, k = d.slice(0, 7);
-  if (k < startMonth(I.acc) || k > CUR) return { delta: 0 };
-  const r = calc(I.acc, k, startOf(I.acc, k)), day = Math.min(+d.slice(8, 10), r.D);
-  // nouvelles opérations : celles du mois, et celles d'un mois passé pas encore clôturé
-  const rest = impRest(I).filter(t => t.date <= d && (t.date.slice(0, 7) === k || !clot(I.acc, t.date.slice(0, 7)))).reduce((a, t) => a + t.montant, 0);
-  // charge fixe reconnue : la courbe compte déjà son montant prévu seulement si elle y figure (pas « en retard », date passée)
-  const ptsDiff = I.kept.filter(t => t.match && t.date <= d && t.date.slice(0, 7) === k).reduce((a, t) => { const ev = r.ev.find(e => e.key === t.match), inCurve = ev && !ev.late && ev.d <= day; return a + t.montant - (inCurve ? ev.v : 0); }, 0);
-  return { delta: I.solde.montant - (r.curve[day - 1] + rest + ptsDiff) };
-}
-// Règle apprise (nom, catégorie, type) pour un marchand de ce compte
-function ruleOp(acc, key, fields) {
-  const ex = DB.regles.find(x => x.compte === acc && x.motif === key);
-  return upd('Regles', Object.assign({ id: ex ? ex.id : uid(), compte: acc, motif: key }, ex ? {} : { categorie: '', nom: '', type: '' }, fields));
-}
-// Rentrée fixe du commun qui fait doublon avec un virement lié (montant et jour proches)
-function dupFixeFor(v) {
-  const a = num(v.montant) || 0, j = num(v.jour) || 1;
-  return DB.fixes.find(f => f.compte === v.vers && f.sens === '+' && bool(f.actif) && Math.abs((num(f.montant) || 0) - a) <= Math.max(2, a * 0.02) && dayGap(num(f.jour) || 1, j) <= 5);
-}
-function commitImport(I0, silent) {
-  const I = I0 || IMP, acc = I.acc, ops = [], pts = {}, res = { ops: 0, fixes: 0, pts: 0, clos: 0, exc: 0, nc: 0, dbl: 0 };
-  const addPt = (t, cle) => { const k = t.date.slice(0, 7), id = k + '|' + cle; if (!pts[id]) pts[id] = { id, compte: acc, mois: k, cle, montantReel: 0 }; pts[id].montantReel = r2(pts[id].montantReel + Math.abs(t.montant)); };
-  // date réelle d'une rentrée fixe vue passer (banque ou import) : gardée pour détecter automatiquement le jour de paie (V2.2)
-  const payArr = {}, notePay = (fid, t) => { (payArr[fid] = payArr[fid] || {})[t.date.slice(0, 7)] = t.date; };
-  I.kept.filter(t => t.match).forEach(t => { addPt(t, t.match); if (t.match[0] === 'f') { const f = DB.fixes.find(x => x.id === t.match.slice(1)); if (f && f.sens === '+') notePay(f.id, t); } });
-  I.kept.filter(t => t.same).forEach(t => ops.push(upd('Operations', { id: t.same, ref: t.ref })));
-  const have = new Set(catsOf(acc).map(c => c.nom.toLowerCase()));
-  let ordre = Math.max(0, ...DB.categories.map(c => num(c.ordre) || 0));
-  const needCat = cat => { if (cat) ops.push(...newCatOps(acc, cat, have)); };
-  if (I.first) I.recur.filter(r => I.keep[r.id]).forEach(r => {
-    const id = uid(), inK = r.txs.filter(t => t.date.slice(0, 7) >= I.mois);
-    if (r.vir && I.virOn[r.id]) {
-      const v = { id, de: acc, vers: r.vir, libelle: r.nom, montant: r.montant, jour: r.jour, profil: ME, debut: I.mois, fin: '', actif: 'oui', motif: r.motif };
-      ops.push(upd('Virements', v)); inK.forEach(t => addPt(t, 'v' + id));
-      const f = dupFixeFor(v); // le relevé du commun a déjà créé cette rentrée : on la remplace par le virement lié
-      if (f) { ops.push(del('Fixes', f.id)); DB.pointages.filter(p => p.cle === 'f' + f.id).forEach(p => { ops.push(del('Pointages', p.id)); const nid = p.mois + '|v' + id; if (!pts[nid]) pts[nid] = { id: nid, compte: p.compte, mois: p.mois, cle: 'v' + id, montantReel: p.montantReel }; }); res.dbl++; }
-    } else { ops.push(upd('Fixes', { id, compte: acc, libelle: r.nom, montant: r.montant, sens: r.sens, jour: r.jour, frequence: 'M', moisRef: '', categorie: r.cat, debut: I.mois, fin: '', actif: 'oui', motif: r.motif })); inK.forEach(t => { addPt(t, 'f' + id); if (r.sens === '+') notePay(id, t); }); }
-    res.fixes++;
-  });
-  const rest = impRest(I);
-  rest.forEach(t => {
-    const cat = impCat(I, t), k = I.kind[t.ref], type = k === 'exc' || k === 'int' ? k : 'ponct';
-    needCat(cat);
-    ops.push(upd('Operations', { id: uid(), compte: acc, date: t.date, montant: r2(t.montant), categorie: cat, libelle: t.libelle.slice(0, 80), profil: ME, type, lien: '', ref: t.ref }));
-    res.ops++; if (type !== 'ponct') res.exc++; if (!cat) res.nc++;
-  });
-  // noms et catégories corrigés, virements entre comptes : retenus pour les prochains imports
-  const rk = {};
-  Object.keys(I.gtouch).forEach(k => { rk[k] = rk[k] || {}; if (k in I.gname) rk[k].nom = I.gname[k]; if (k in I.gcat) rk[k].categorie = I.gcat[k]; });
-  rest.filter(t => I.kind[t.ref] === 'int').forEach(t => { rk[gk(t)] = Object.assign(rk[gk(t)] || {}, { type: 'int' }); });
-  Object.entries(rk).forEach(([k, f]) => ops.push(ruleOp(acc, k, f)));
-  Object.values(pts).forEach(p => ops.push(upd('Pointages', p)));
-  res.pts = Object.keys(pts).length;
-  if (I.first) {
-    const sIn = num(($('impSolde') || {}).value);
-    const S = sIn !== null ? sIn : I.solde ? I.solde.montant : 0, D = I.solde && sIn === I.solde.montant ? I.solde.date : I.tx[I.tx.length - 1].date;
-    const M = I.kept.filter(t => t.date <= D).reduce((a, t) => a + t.montant, 0), s0 = r2(S - M);
-    ops.push(upd('Comptes', { id: acc, soldeDepart: s0, moisDepart: I.mois }));
-    const lastM = I.kept.length ? I.kept[I.kept.length - 1].date.slice(0, 7) : I.mois;
-    for (let k = I.mois; k < lastM && k < CUR; k = addM(k, 1)) {
-      const end = k + '-31', bal = s0 + I.kept.filter(t => t.date <= end).reduce((a, t) => a + t.montant, 0);
-      ops.push(upd('Clotures', { id: acc + '|' + k, compte: acc, mois: k, soldeFin: r2(bal), dateCloture: TODAY_ISO })); res.clos++;
+  if (solde && typeof solde.montant === 'number') {
+    if (st) { // démarrage : solde de départ = solde de la banque − opérations depuis le début du cycle
+      const sum = DB.mouvements.filter(o => o.compte === acc && o.date >= S.debut && o.date <= solde.date).reduce((a, o) => a + (num(o.montant) || 0), 0);
+      stage([upd('Cycles', { id: acc + '|' + S.mois, compte: acc, mois: S.mois, debut: S.debut, montant: S.montant || '', soldeDepart: r2(solde.montant - sum), manuel: 'b' })]);
+    } else if (solde.date >= S.debut) { // recalage : la banque fait foi
+      const b = balanceAt(acc, solde.date), delta = b === null ? 0 : r2(solde.montant - b);
+      if (Math.abs(delta) >= 1) { stage([upd('Mouvements', { id: uid(), compte: acc, date: solde.date, montant: delta, libelle: 'Correction (solde de la banque)', nom: 'Correction (solde de la banque)', categorie: '', type: 'ajust', lien: '', auto: '', ref: '', profil: '' })]); res.recal = delta; }
     }
   }
-  ops.push(upd('Parametres', { cle: 'imp14|' + acc, valeur: TODAY_ISO }));
-  if (Object.keys(payArr).length) {
-    let h; try { h = JSON.parse(param('paye|' + acc, '{}')) || {}; } catch (e) { h = {}; }
-    Object.entries(payArr).forEach(([fid, ms]) => h[fid] = Object.assign(h[fid] || {}, ms));
-    ops.push(upd('Parametres', { cle: 'paye|' + acc, valeur: JSON.stringify(h) }));
-  }
-  const recal = !I.first && I.solde && I.recal ? r2(soldeDelta(I).delta) : 0;
-  commit(ops);
-  if (Math.abs(recal) >= 1) { commit([upd('Operations', { id: uid(), compte: acc, date: I.solde.date, montant: recal, categorie: 'Correction de solde', libelle: I.parsed.format === 'Banque' ? 'Correction (solde de la banque)' : 'Correction (relevé importé)', profil: ME, type: 'ajust', lien: '', ref: '' })]); res.recal = recal; }
-  if (silent) return res;
-  I.result = res; I.step = 'done'; I.steps = null; render(); scrollTo(0, 0);
+  return res;
 }
-
-
-
 /* ================= V2 : connexion bancaire ================= */
 const BK = { busy: false, last: store.get('le31-bk-last', 0), res: null, err: {}, view: null, acc: null, q: '', list: null, sel: {}, mode: {}, queue: [], auto: store.get('le31-bk-auto', true), msg: '' };
 const bkConf = () => DB.banqueConf[0] || {};
@@ -1640,46 +745,36 @@ const bkLinked = () => accs().filter(a => bkRow(a.id)).map(a => a.id);
 function bkPend() { try { return JSON.parse(bkConf().attente || 'null'); } catch (e) { return null; } }
 const bkDays = r => r && r.jusqua ? Math.floor((new Date(r.jusqua) - Date.now()) / 864e5) : 999;
 const isoAdd = (iso, n) => { const d = new Date(iso + 'T12:00:00Z'); d.setUTCDate(d.getUTCDate() + n); return d.toISOString().slice(0, 10); };
-const lastRefDate = acc => DB.operations.filter(o => o.compte === acc && o.ref).reduce((m, o) => String(o.date) > m ? String(o.date) : m, '');
 
-// Lecture de la banque : silencieuse pour un compte déjà démarré, import guidé pour un compte neuf ou « tout reconstruire »
+// Lecture de la banque (V3) : à partir du début du suivi du compte, 10 jours de recouvrement (les doublons sont ignorés)
+// o.start = { compte: {debut, mois, montant} } : premier passage, le solde de départ est calculé depuis la banque
 async function bankSync(o) {
   o = o || {};
   if (BK.busy || !bkOn() || !JETON()) return;
-  const linked = bkLinked(); if (!linked.length) return;
+  const linked = bkLinked().filter(a => started3(a) || (o.start && o.start[a])); if (!linked.length) return;
   BK.busy = true; BK.msg = ''; render();
-  const depuis = {}, first = o.first || {}, P = [];
-  linked.forEach(acc => {
-    const b0 = param('bk0|' + acc, '');
-    if (first[acc] === 'refaire' || !started(acc)) depuis[acc] = isoAdd(TODAY_ISO, -400); // la banque fournit ce qu'elle peut (souvent 90 j à 13 mois)
-    else if (first[acc] === 'reprendre' || !b0) depuis[acc] = lastRefDate(acc) || isoAdd(TODAY_ISO, -60); // dès le jour du dernier import : les opérations déjà là sont reconnues
-    else depuis[acc] = [b0, lastRefDate(acc) ? isoAdd(lastRefDate(acc), -10) : b0].sort().pop(); // 10 jours de recouvrement : les doublons sont ignorés
-    if (!b0 || first[acc]) P.push(upd('Parametres', { cle: 'bk0|' + acc, valeur: depuis[acc] }));
-  });
+  const depuis = {};
+  linked.forEach(acc => { const S = (o.start && o.start[acc]) || v3(acc), last = lastBankDate(acc), d = last ? isoAdd(last, -10) : S.debut; depuis[acc] = d > S.debut ? d : S.debut; });
   try {
-    const j = await api({ action: 'banqueSync', depuis, force: !!o.force });
+    const j = await api({ action: 'banqueSync', depuis, comptes: linked, force: !!o.force });
     if (j.acces) store.set('le31-acces', j.acces);
     received(j.data, j.moi);
-    if (P.length) commit(P);
     BK.last = Date.now(); store.set('le31-bk-last', BK.last);
-    const tot = { ops: 0, pts: 0, nc: 0, recal: 0, n: 0 };
+    const tot = { n: 0, auto: 0, todo: 0, recal: 0, k: 0 };
     (j.comptes || []).forEach(c => {
       BK.err[c.compte] = c.erreur === 'recent' ? '' : c.erreur;
       if (c.erreur) return;
-      const parsed = { tx: c.tx, solde: c.solde, format: 'Banque' };
-      if (!c.tx.length && !c.solde) return;
-      if (first[c.compte] === 'refaire' || !started(c.compte)) { if (c.tx.length) BK.queue.push({ acc: c.compte, parsed, mode: first[c.compte] === 'refaire' ? 'reset' : null }); return; }
-      const I = startImport(parsed, 'add', { acc: c.compte, silent: true });
-      const r = commitImport(I, true); tot.ops += r.ops; tot.pts += r.pts; tot.nc += r.nc; tot.n++; if (r.recal) tot.recal += r.recal;
+      const r = ingest(c.compte, c.tx || [], c.solde, o.start && o.start[c.compte]);
+      tot.n += r.n; tot.auto += r.auto; tot.todo += r.todo; tot.recal += r.recal || 0; tot.k++;
     });
-    BK.res = tot.n ? tot : BK.res;
+    if (tot.n) BK.res = tot;
+    commit([]);
   } catch (e) { BK.msg = String(e.message || e); }
   BK.busy = false;
-  if (BK.queue.length && !UI.imp) { const q = BK.queue.shift(); UI.acc = q.acc; startImport(q.parsed, q.mode, { acc: q.acc }); }
   render();
 }
 function bankAuto() {
-  if (!BK.auto || BK.busy || UI.imp || BK.view || !LOADED || !bkOn() || bkPend()) return;
+  if (!BK.auto || BK.busy || BK.view || !LOADED || !bkOn() || bkPend()) return;
   if (Date.now() - BK.last < 2 * 3600 * 1000) return;
   if (bkLinked().some(a => bkDays(bkRow(a)) >= 0)) bankSync({});
 }
@@ -1712,13 +807,12 @@ async function bankLink() {
     const j = await api({ action: 'banqueLier', sid: P.sid, liens }); received(j.data, j.moi);
     BK.busy = false; BK.view = null;
     if (!used.length) { toast('Aucun compte suivi'); render(); return; }
-    const first = {}; used.forEach(a => first[a] = started(a) ? (BK.mode[a] || 'reprendre') : 'neuf');
-    toast('Compte' + (used.length > 1 ? 's reliés' : ' relié') + ' : première lecture…');
-    await bankSync({ force: true, first });
+    toast('Compte' + (used.length > 1 ? 's reliés' : ' relié'));
+    if (used.some(started3)) await bankSync({ force: true });
   } catch (e) { BK.busy = false; toast('Banque : ' + (e.detail || e.message)); render(); }
 }
 async function bankUnlink(acc) {
-  try { const j = await api({ action: 'banqueDelier', compte: acc }); received(j.data, j.moi); toast('Compte délié : retour à l\'import de relevés'); } catch (e) { toast('Erreur : ' + e.message); }
+  try { const j = await api({ action: 'banqueDelier', compte: acc }); received(j.data, j.moi); toast('Compte délié : saisie à la main'); } catch (e) { toast('Erreur : ' + e.message); }
 }
 // défaut proposé : compte courant -> compte choisi, compte joint -> commun, épargne -> ne pas suivre
 function bkGuess(P) {
@@ -1736,18 +830,18 @@ const bkTime = acc => { const r = bkRow(acc); if (!r || !r.derniere) return ''; 
 function bankChip() {
   const el = $('bankChip'); if (!el) return;
   const acc = UI.acc, r = bkRow(acc);
-  el.hidden = !bkOn() || !r || !!gate() || !!(UI.imp && IMP) || !!BK.view;
+  el.hidden = !bkOn() || !r || !!gate() || !!BK.view;
   if (el.hidden) return;
   const warn = bkDays(r) <= 7 || BK.err[acc] === 'expire';
   el.className = 'bkchip' + (BK.busy ? ' busy' : warn || BK.err[acc] ? ' warn' : '');
   el.innerHTML = BK.busy ? '<span class="spin"></span>Banque…' : warn ? '⚠ Banque' : `✓ Banque${bkTime(acc) ? ' · ' + bkTime(acc) : ''}`;
   el.title = warn ? 'Accord bancaire à renouveler' : 'Lire la banque maintenant';
 }
-// bandeaux de l'onglet Mois
+// bandeaux de l'accueil
 function bankBanners(acc) {
   if (!bkOn()) return '';
   let h = ''; const r = bkRow(acc), e = BK.err[acc];
-  if (BK.res && BK.res.ops + BK.res.pts > 0) h += `<div class="banner good"><span><b>${BK.res.ops} nouvelle${BK.res.ops > 1 ? 's' : ''} opération${BK.res.ops > 1 ? 's' : ''}</b> de la banque${BK.res.pts ? ` · ${BK.res.pts} prélèvement${BK.res.pts > 1 ? 's' : ''} pointé${BK.res.pts > 1 ? 's' : ''}` : ''}${BK.res.nc ? ` · <b>${BK.res.nc} à classer</b>` : ''}</span><span style="display:flex;gap:6px">${BK.res.nc ? '<button class="btn small" data-bkvoir="1">Voir</button>' : ''}<button class="btn ghost small" data-bkok="1">OK</button></span></div>`;
+  if (BK.res && BK.res.n > 0) h += `<div class="banner good"><span><b>${BK.res.n} nouvelle${BK.res.n > 1 ? 's' : ''} opération${BK.res.n > 1 ? 's' : ''}</b> de la banque${BK.res.auto ? ` · ${BK.res.auto} classée${BK.res.auto > 1 ? 's' : ''} seule${BK.res.auto > 1 ? 's' : ''}` : ''}${BK.res.todo ? ` · <b>${BK.res.todo} à classer</b>` : ''}</span><span style="display:flex;gap:6px">${BK.res.todo ? '<button class="btn small" data-tab="todo">Voir</button>' : ''}<button class="btn ghost small" data-bkok="1">OK</button></span></div>`;
   if (r && (e === 'expire' || bkDays(r) < 0)) h += `<div class="banner warn"><span>L'accord avec <b>${esc(r.aspsp)}</b> est terminé : Le 31 ne lit plus ce compte.</span><button class="btn small" data-bkrenew="${esc(acc)}">Renouveler</button></div>`;
   else if (r && bkDays(r) <= 7) h += `<div class="banner warn"><span>L'accord avec <b>${esc(r.aspsp)}</b> se termine dans <b>${bkDays(r)} jour${bkDays(r) > 1 ? 's' : ''}</b>.</span><button class="btn small" data-bkrenew="${esc(acc)}">Renouveler</button></div>`;
   if (r && e === 'limite') h += `<div class="banner warn"><span>${esc(r.aspsp)} limite le nombre de lectures par jour : nouvel essai plus tard. Données du ${esc(bkTime(acc) || 'dernier passage')}.</span></div>`;
@@ -1757,10 +851,10 @@ function bankBanners(acc) {
 }
 // Réglages > Connexion bancaire
 function vBankSet() {
-  const head = `<div class="rowhead"><h2>Connexion bancaire</h2><span class="sub">V2</span></div>`;
-  if (!bkOn()) return `<div class="hero" style="gap:10px">${head}<div class="hint" style="font-size:13px">Pas encore configurée. La personne qui a installé Le 31 la met en place une fois : application Enable Banking (tuto <b>4-ENABLE-BANKING</b>), puis menu <b>Le 31 > Connexion bancaire</b> dans le Google Sheet. En attendant, l'import de relevés marche comme avant.</div></div>`;
+  const head = `<div class="rowhead"><h2>Connexion bancaire</h2></div>`;
+  if (!bkOn()) return `<div class="hero" style="gap:10px">${head}<div class="hint" style="font-size:13px">Pas encore configurée. La personne qui a installé Le 31 la met en place une fois : application Enable Banking (tuto <b>4-ENABLE-BANKING</b>), puis menu <b>Le 31 > Connexion bancaire</b> dans le Google Sheet. En attendant, les opérations se saisissent à la main.</div></div>`;
   const row = a => { const r = bkRow(a.id), d = bkDays(r);
-    return `<div class="item" style="grid-template-columns:40px 1fr auto" disabled><span class="day" style="${r ? 'background:var(--good-soft);color:var(--good)' : ''}">${r ? '✓' : '—'}</span><span class="lbl"><b>${esc(a.nom)}</b><small>${r ? `${esc(r.aspsp)} ${esc(r.fin)} · ${d < 0 ? '<span style="color:var(--bad)">accord terminé</span>' : 'accord jusqu\'au ' + fmtD(r.jusqua)}${r.derniere ? ' · lu ' + esc(bkTime(a.id)) : ''}` : 'Pas relié : import de relevés à la main'}</small></span>
+    return `<div class="item" style="grid-template-columns:40px 1fr auto" disabled><span class="day" style="${r ? 'background:var(--good-soft);color:var(--good)' : ''}">${r ? '✓' : '—'}</span><span class="lbl"><b>${esc(a.nom)}</b><small>${r ? `${esc(r.aspsp)} ${esc(r.fin)} · ${d < 0 ? '<span style="color:var(--bad)">accord terminé</span>' : 'accord jusqu\'au ' + fmtD(r.jusqua)}${r.derniere ? ' · lu ' + esc(bkTime(a.id)) : ''}` : 'Pas relié : saisie à la main'}</small></span>
       <span style="display:flex;gap:6px">${r ? `${d <= 30 ? `<button class="btn small" data-bkrenew="${esc(a.id)}">Renouveler</button>` : ''}<button class="btn ghost small" data-bkunlink="${esc(a.id)}">Délier</button>` : `<button class="btn small" data-bklink="${esc(a.id)}">Relier</button>`}</span></div>`; };
   return `<div class="hero" style="gap:10px">${head}
     <div class="hint" style="font-size:13px">Le 31 lit les opérations de la banque à chaque ouverture (lecture seule : aucun virement possible). Via Enable Banking, avec la clé du foyer gardée dans Apps Script.</div>
@@ -1783,7 +877,7 @@ function vBank() {
     return `<section class="view"><div class="steps"><i class="on"></i><i></i><i></i></div><div class="rowhead"><h2>Ta banque</h2>${close}</div>
       <p class="hint" style="font-size:14px;margin:0">Pour : <b>${esc(accName(BK.acc))}</b>. Tu vas passer quelques instants sur la page de ta banque pour donner ton accord (lecture seule, ${'180'} jours au plus).</p>
       <div class="search"><input id="bkQ" placeholder="Rechercher (Crédit Mutuel, Bourso…)" value="${esc(BK.q)}" autocomplete="off"></div>
-      <div class="list">${l.map(b => `<button class="item" style="grid-template-columns:1fr auto" data-bkbank="${esc(b.n)}" ${BK.busy ? 'disabled' : ''}><span class="lbl"><b>${esc(b.n)}</b></span><span>›</span></button>`).join('') || '<div class="empty">Banque introuvable : elle n\'est peut-être pas couverte. L\'import de relevés reste possible.</div>'}</div>
+      <div class="list">${l.map(b => `<button class="item" style="grid-template-columns:1fr auto" data-bkbank="${esc(b.n)}" ${BK.busy ? 'disabled' : ''}><span class="lbl"><b>${esc(b.n)}</b></span><span>›</span></button>`).join('') || '<div class="empty">Banque introuvable : elle n\'est peut-être pas couverte. La saisie à la main reste possible.</div>'}</div>
       ${BK.busy ? '<p class="hint"><span class="spin"></span> Direction la banque…</p>' : ''}
       ${IOS ? '<div class="note">Sur iPhone/iPad : si la banque ouvre son application pour valider, reviens ensuite sur la page de la banque, elle te ramènera dans Le 31.</div>' : ''}</section>`;
   }
@@ -1795,16 +889,12 @@ function vBank() {
     <p class="hint" style="font-size:14px;margin:0">${esc(P.aspsp)} a partagé ${P.comptes.length} compte${P.comptes.length > 1 ? 's' : ''}. Associe chacun à un compte de Le 31.</p>
     <div class="list">${P.comptes.map(a => `<div class="rec" style="grid-template-columns:1fr auto"><div class="rl"><b>${esc(a.nom)}</b><div class="raw">${esc(a.fin)}</div><select data-bksel="${esc(a.uid)}">${opts(BK.sel[a.uid])}</select></div><div class="rr">${a.solde ? `<span class="amt ${a.solde.montant >= 0 ? '' : 'neg'}">${eur(a.solde.montant)}</span>` : ''}</div></div>`).join('')}</div>
     <div class="hint">Un livret d'épargne peut rester « Ne pas suivre » : les virements vers lui sont déjà reconnus comme « Entre mes comptes ».</div>
-    ${chosen.map(acc => started(acc) ? `<div class="hero" style="gap:8px"><b>${esc(accName(acc))}</b>
-      <label class="check"><input type="radio" name="bkm-${esc(acc)}" data-bkmode="${esc(acc)}" value="reprendre" ${(BK.mode[acc] || 'reprendre') === 'reprendre' ? 'checked' : ''}><span><b>Reprendre après le dernier import</b>${lastRefDate(acc) ? ` (${fmtD(lastRefDate(acc))})` : ''}<br><small class="mini">Recommandé : catégories, noms et charges fixes gardés. Seules les nouvelles opérations arrivent, et le solde est recalé sur celui de la banque.</small></span></label>
-      <label class="check"><input type="radio" name="bkm-${esc(acc)}" data-bkmode="${esc(acc)}" value="refaire" ${BK.mode[acc] === 'refaire' ? 'checked' : ''}><span><b>Tout reconstruire depuis la banque</b><br><small class="mini">Comme « Tout refaire » avec un relevé, sur l'historique fourni par la banque (souvent 90 jours à 13 mois).</small></span></label></div>`
-      : `<div class="note">${esc(accName(acc))} : premier import à partir de l'historique de la banque (charges fixes à confirmer, comme avec un relevé).</div>`).join('')}
+    ${chosen.filter(a => !started3(a)).map(acc => `<div class="note">${esc(accName(acc))} : le suivi démarre ensuite depuis l'accueil (date de début du cycle), la banque est lue à partir de cette date.</div>`).join('')}
     <button class="btn" data-bklier="1" ${BK.busy ? 'disabled' : ''}>${BK.busy ? 'Enregistrement…' : 'Valider'}</button></section>`;
 }
 // annuler l'association : la session bancaire est refermée côté serveur
 async function bankLinkCancel() { const P = bkPend(); if (!P) return; try { const j = await api({ action: 'banqueLier', sid: P.sid, liens: [] }); received(j.data, j.moi); } catch (e) {} }
 
-/* ----- Profils et accès ----- */
 const fmtD = iso => { const d = new Date(iso); return isNaN(d) ? '' : d.toLocaleDateString('fr-FR', { day: 'numeric', month: 'short' }); };
 function vProfiles() {
   const myAcc = store.get('le31-acces', '');
@@ -1851,114 +941,1057 @@ const sheetRoot = $('sheetRoot');
 function openSheet(html) { sheetRoot.innerHTML = `<div class="sheet-bg" data-closebg="1"><div class="sheet" role="dialog" aria-modal="true"><div class="grab"></div>${html}</div></div>`; const f = sheetRoot.querySelector('input:not([type=checkbox]),select'); if (f && !f.value && f.id !== 'fF') setTimeout(() => f.focus(), 50); }
 function closeSheet() { sheetRoot.innerHTML = ''; }
 function monthOpts(sel, from, n) { return Array.from({ length: n }, (_, i) => { const k = addM(from, i); return `<option value="${k}" ${k === sel ? 'selected' : ''}>${mLabel(k)}</option>`; }).join(''); }
-// Opération ponctuelle -> charge fixe : ses opérations (et celles du même marchand) depuis le mois choisi deviennent les prélèvements de la charge
-function fixFromOp(o) {
-  const sim = [o].concat(simOps(o)).sort((x, y) => String(x.date).localeCompare(String(y.date)));
-  const recent = sim.filter(x => String(x.date).slice(0, 7) >= addM(CUR, -12)), amts = recent.slice(-6).map(x => Math.abs(num(x.montant) || 0));
-  const first = String((recent[0] || o).date).slice(0, 7);
-  sheetRoot.dataset.sens = (num(o.montant) || 0) > 0 ? '+' : '-';
-  fixedSheet({ id: '', libelle: nameOf(o), montant: r2(median(amts)), sens: (num(o.montant) || 0) > 0 ? '+' : '-', jour: String(+String(o.date).slice(8, 10)), frequence: 'M', moisRef: '', categorie: o.categorie || '', debut: first < startMonth(o.compte) ? startMonth(o.compte) : first, fin: '', actif: 'oui', compte: o.compte }, 'fix', o);
+/* ================= Premier lancement ================= */
+const ONB = { step: 0, name: '', mode: '', partner: '', commun: true, busy: false };
+function vOnboard() {
+  const O = ONB, head = n => `<div class="steps" style="display:flex;gap:6px">${[0, 1, 2].map(i => `<i style="flex:1;height:4px;border-radius:9px;background:var(--${i <= n ? 'accent' : 'line'})"></i>`).join('')}</div>`;
+  if (O.step === 0) return `<section class="view">${head(0)}<h2 style="font-size:24px">Bienvenue sur Le 31</h2><p class="hint" style="font-size:14px">L'appli qui vous dit si vous tenez jusqu'au 31. Deux questions pour commencer.</p>
+    <form class="form" id="onbName" novalidate><div class="field"><label for="onbN">Ton prénom</label><input id="onbN" value="${esc(O.name)}" placeholder="Ex. Alex" autocomplete="given-name"></div><button class="btn" type="submit">Continuer</button></form></section>`;
+  if (O.step === 1) return `<section class="view">${head(1)}<h2 style="font-size:24px">Tu utilises Le 31…</h2>
+    <div class="two"><button class="chip" style="border-radius:16px;padding:14px;text-align:left" data-onbmode="solo" aria-pressed="${O.mode === 'solo'}"><b style="font-size:16px;display:block">Seul</b><span style="font-weight:500">Mon compte, et un compte commun si j'en ai un</span></button>
+    <button class="chip" style="border-radius:16px;padding:14px;text-align:left" data-onbmode="duo" aria-pressed="${O.mode === 'duo'}"><b style="font-size:16px;display:block">À deux</b><span style="font-weight:500">Un perso chacun et un compte commun</span></button></div>
+    ${O.mode === 'duo' ? `<div class="field"><label for="onbP">Prénom de ton/ta partenaire</label><input id="onbP" value="${esc(O.partner)}" placeholder="Ex. Camille" autocomplete="off"></div>
+      <div class="note">Chacun aura son propre lien d'accès. ${esc(O.partner || 'Ton/ta partenaire')} verra le <b>compte commun</b> et <b>son</b> compte perso, jamais le tien.</div>` : ''}
+    ${O.mode === 'solo' ? `<label class="switch" for="onbC"><span>J'ai aussi un compte commun à suivre</span><input type="checkbox" id="onbC" ${O.commun ? 'checked' : ''}></label>` : ''}
+    <div class="actions"><button class="btn ghost" data-onbstep="0">Retour</button><button class="btn" data-onbstep="2">Continuer</button></div></section>`;
+  const accsL = [`<b>Compte perso de ${esc(O.name)}</b> · visible seulement par toi`];
+  if (O.mode === 'duo') accsL.push(`<b>Compte perso de ${esc(O.partner)}</b> · visible seulement par ${esc(O.partner)}, démarré sur son téléphone`);
+  if (O.mode === 'duo' || O.commun) accsL.push(`<b>Compte commun</b> · visible par ${O.mode === 'duo' ? 'vous deux' : 'toi'}`);
+  return `<section class="view">${head(2)}<h2 style="font-size:24px">Vos comptes</h2>
+    <div class="list">${accsL.map(l => `<div class="item" disabled style="grid-template-columns:1fr"><span class="lbl" style="white-space:normal">${l}</span></div>`).join('')}</div>
+    <div class="hint">Les noms se changent ensuite dans Réglages.${O.mode === 'duo' ? ` Tu enverras son lien à ${esc(O.partner)} depuis Réglages > Profils.` : ''}</div>
+    <div class="actions"><button class="btn ghost" data-onbstep="1">Retour</button><button class="btn" data-onbdone="1" ${O.busy ? 'disabled' : ''}>${O.busy ? 'Création…' : 'Créer mes comptes'}</button></div></section>`;
 }
-function fixedSheet(f, kind, fromOp) {
-  const isNew = !f || (fromOp && !f.id), acc = fromOp ? fromOp.compte : UI.acc, oth = otherAcc(acc);
-  kind = kind || 'fix';
-  if (kind === 'vir') f = f || { id: '', libelle: 'Apport au ' + accName(oth), montant: '', jour: '1', de: acc, vers: oth, profil: (profiles()[0] || {}).id, debut: CUR, fin: '', actif: 'oui' };
-  else f = f || { id: '', libelle: '', montant: '', sens: sheetRoot.dataset.sens || '-', jour: '1', frequence: 'M', moisRef: String(pm(CUR).m + 1), categorie: '', debut: CUR, fin: '', actif: 'oui' };
-  const p = !isNew && point(CUR, (kind === 'vir' ? 'v' : 'f') + f.id);
-  const catList = [...new Set(catsOf(acc).map(c => c.nom).concat(DB.fixes.map(x => x.categorie)).filter(Boolean).concat(['Logement', 'Crédits', 'Énergie', 'Assurances', 'Abonnements', 'Impôts', 'Enfants', 'Épargne', 'Revenus']))];
-  const nSim = fromOp ? 1 + simOps(fromOp).length : 0;
-  openSheet(`<form class="form" id="fixForm" data-id="${esc(f.id)}" data-kind="${kind}" data-fromop="${fromOp ? esc(fromOp.id) : ''}" novalidate>
-    <h2>${fromOp ? 'Passer en charge fixe' : isNew ? 'Nouvelle opération fixe' : 'Modifier'}</h2>
-    ${fromOp ? `<div class="note">Le montant proposé est la médiane des derniers mois. Les opérations « ${esc(nameOf(fromOp))} » (${nSim} en tout) à partir du mois choisi deviennent les prélèvements de cette charge : elles sont comptées une seule fois. Une charge qui s'arrête un temps (abonnement en pause) se met en pause dans l'onglet Fixes.</div>` : ''}
-    ${isNew && !fromOp ? `<div class="seg" style="grid-template-columns:1fr 1fr 1fr"><button type="button" data-fkind="-" aria-pressed="${kind === 'fix' && f.sens === '-'}">Charge</button><button type="button" data-fkind="+" aria-pressed="${kind === 'fix' && f.sens === '+'}">Rentrée</button><button type="button" data-fkind="vir" aria-pressed="${kind === 'vir'}">Virement</button></div>` : ''}
-    ${kind === 'vir' ? `<div class="field"><label for="fDir">Sens</label><select id="fDir">${accs().map(a => accs().filter(b => b.id !== a.id).map(b => `<option value="${esc(a.id)}>${esc(b.id)}" ${f.de === a.id && f.vers === b.id ? 'selected' : ''}>${esc(a.nom)} → ${esc(b.nom)}</option>`).join('')).join('')}</select></div>` : ''}
-    <div class="field"><label for="fL">Libellé</label><input id="fL" value="${esc(f.libelle)}" placeholder="${kind === 'vir' ? 'Ex. Apport mensuel' : 'Ex. Électricité'}" autocomplete="off"></div>
-    <div class="two"><div class="field"><label for="fA">Montant (€)</label><input id="fA" inputmode="decimal" value="${fr(f.montant)}"></div>
-    <div class="field"><label for="fD">Jour du prélèvement</label><input id="fD" type="number" inputmode="numeric" min="1" max="31" value="${esc(f.jour)}"></div></div>
-    ${kind === 'vir' ? (profiles().length > 1 ? `<div class="field"><label for="fW">Versé par</label><select id="fW"><option value="">—</option>${profiles().map(x => `<option value="${esc(x.id)}" ${x.id === f.profil ? 'selected' : ''}>${esc(x.nom)}</option>`).join('')}</select></div>` : '') :
-    `<div class="two"><div class="field"><label for="fF">Fréquence</label><select id="fF">${Object.entries(FREQ).map(([k, v]) => `<option value="${k}" ${k === (f.frequence || 'M') ? 'selected' : ''}>${v}</option>`).join('')}</select></div>
-    <div class="field"><label for="fS">Mois du prélèvement</label><select id="fS">${MONTHS_L.map((n, i) => `<option value="${i + 1}" ${i + 1 === (num(f.moisRef) || 1) ? 'selected' : ''}>${n}</option>`).join('')}</select></div></div>
-    <div class="hint" style="margin-top:-6px">Le mois du prélèvement ne sert que pour le trimestriel et l'annuel.</div>
-    <div class="field"><label for="fC">Catégorie</label><input id="fC" list="fCl" value="${esc(f.categorie)}" placeholder="Ex. Énergie" autocomplete="off"><datalist id="fCl">${catList.map(c => `<option value="${esc(c)}">`).join('')}</datalist></div>`}
-    <div class="two"><div class="field"><label for="fB">À partir de</label><select id="fB">${monthOpts(f.debut || CUR, addM(f.debut && f.debut < CUR ? f.debut : CUR, -12), 36)}</select></div>
-    <div class="field"><label for="fE">Dernière échéance</label><select id="fE"><option value="">Sans fin</option>${monthOpts(f.fin, f.fin && f.fin < addM(CUR, -1) ? f.fin : addM(CUR, -1), 120)}</select></div></div>
-    <label class="switch" for="fOn"><span>Active (décomptée automatiquement)</span><input type="checkbox" id="fOn" ${bool(f.actif) ? 'checked' : ''}></label>
-    ${p ? `<div class="note good" style="display:flex;justify-content:space-between;align-items:center;gap:8px"><span>Pointé ce mois : <b>${eur(num(p.montantReel))}</b></span><button type="button" class="btn ghost small" data-unpoint="${esc(p.id)}">Annuler</button></div>` : ''}
-    ${(kind === 'vir' ? (isShared(f.de) || isShared(f.vers)) : isShared(f.compte || acc)) ? `<div class="note">Compte partagé : ${isNew ? 'cette opération sera visible' : 'cette modification s\'applique'} aussi pour ${esc(otherNames())}.</div>` : ''}
-    <div class="actions">${isNew ? '' : `<button type="button" class="btn danger" data-del="${kind}:${esc(f.id)}">Supprimer</button>`}<button class="btn" type="submit">Enregistrer</button></div>
-    <div class="hint">Pour une charge qui s'arrête (fin de crédit…), indique la dernière échéance plutôt que de la supprimer : l'historique reste juste.</div>
-    <div id="confirmBox"></div>
-  </form>`);
+async function finishOnboard() {
+  const O = ONB; if (O.busy) return;
+  const p1 = 'p' + uid(), ops = [upd('Profils', { id: p1, nom: O.name, perso: 'oui', ordre: 1 })];
+  ops.push(upd('Comptes', { id: 'perso-' + p1, nom: 'Perso ' + O.name, proprietaire: p1, soldeDepart: '', moisDepart: '', seuil: 200, ordre: 1 }));
+  if (O.mode === 'duo') ops.push(upd('Profils', { id: 'p' + uid(), nom: O.partner, perso: 'oui', ordre: 2 }));
+  if (O.mode === 'duo' || O.commun) ops.push(upd('Comptes', { id: 'commun', nom: 'Compte commun', proprietaire: '', soldeDepart: '', moisDepart: '', seuil: 150, ordre: 2 }));
+  O.busy = true; render();
+  try { const j = await api({ action: 'ops', ops: clean(ops), associer: p1 }); UI.acc = 'perso-' + p1; received(j.data, j.moi); toast('Comptes créés'); }
+  catch (e) { toast(e instanceof TypeError ? 'Connexion nécessaire pour créer les comptes' : 'Erreur : ' + e.message); }
+  O.busy = false; render();
 }
-function catSheet(acc, c) {
-  openSheet(`<form class="form" id="catForm" data-acc="${esc(acc)}" data-id="${c ? esc(c.id) : ''}" novalidate>
-    <h2>${c ? 'Modifier la catégorie' : 'Nouvelle catégorie'}</h2>
-    <div class="mini" style="font-size:13px">${esc(accName(acc))}</div>
-    <div class="field"><label for="cN">Nom</label><input id="cN" value="${c ? esc(leafOf(c.nom)) : ''}" placeholder="Ex. Garage" autocomplete="off"></div>
-    ${(() => { const kids = c && catsOf(acc).some(x => x.nom.startsWith(c.nom + SEP)), tops = catsOf(acc).filter(x => !x.nom.includes(SEP) && (!c || x.id !== c.id) && !isIncomeCat(x.nom));
-      return kids ? `<div class="hint">Catégorie principale : ses sous-catégories sont ${catsOf(acc).filter(x => x.nom.startsWith(c.nom + SEP)).map(x => esc(leafOf(x.nom))).join(', ')}.</div>`
-        : `<div class="field"><label for="cP">Ranger dans</label><select id="cP"><option value="">— Catégorie principale —</option>${tops.map(x => `<option ${c && topOf(c.nom) === x.nom && c.nom.includes(SEP) ? 'selected' : ''}>${esc(x.nom)}</option>`).join('')}</select>
-        <div class="hint">Ex. ranger Carburant, Garage et Péage dans Véhicule : le Bilan et l'onglet Mois pourront montrer Véhicule en entier ou dans le détail.</div></div>`; })()}
-    <div class="field"><label for="cB">Enveloppe mensuelle (€, optionnel)</label><input id="cB" inputmode="decimal" value="${c ? fr(c.budget) : ''}" placeholder="Vide = pas d'enveloppe"></div>
-    ${isShared(acc) ? `<div class="note">Compte partagé : la catégorie est la même pour ${esc(otherNames())}.</div>` : ''}
-    <div class="actions">${c ? `<button type="button" class="btn danger" data-catdel="${esc(c.id)}">Supprimer</button>` : ''}<button class="btn" type="submit">Enregistrer</button></div>
-    <div id="confirmBox"></div></form>`);
+// La personne invitée crée son compte perso à sa première ouverture
+function ensurePerso() {
+  if (!ME) return;
+  const p = DB.profils.find(x => x.id === ME);
+  if (!p || p.perso !== 'oui' || DB.comptes.some(c => c.proprietaire === ME)) return;
+  const id = 'perso-' + ME;
+  UI.acc = id;
+  commit([upd('Comptes', { id, nom: 'Perso ' + p.nom, proprietaire: ME, soldeDepart: '', moisDepart: '', seuil: 200, ordre: 1 })]);
 }
-function simOps(o) { if (!o.ref) return []; const k = keyOf(o.libelle), pos = (num(o.montant) || 0) > 0; return DB.operations.filter(x => x.compte === o.compte && x.ref && x.id !== o.id && keyOf(x.libelle) === k && ((num(x.montant) || 0) > 0) === pos); }
+
+
+/* ================= Interface ================= */
+const UI = { acc: store.get('le31-compte', ''), tab: 'home', txTab: 'ponct', txSeg: 'real', cyc: {}, jpj: store.get('le31-jpj', true), jpjAll: false,
+  td: {}, simTab: 'achat', theme: store.get('le31-theme', 'auto'), startAcc: {},
+  calTab: 'cyc', mpm: store.get('le31-mpm', 'g'), mpmOpen: store.get('le31-mpmo', false), epM: '', epL: '', epS: 'tot', epMpmOpen: store.get('le31-epmo', false), epMpm: store.get('le31-epmpm', 'g'), eplAll: false };
+const main = $('main');
+const VIEWS = { home: () => vHome(), todo: () => vTodo(), tx: () => vTx(), bud: () => vBud(), plus: () => vPlus(), cal: () => vCal(), sim: () => vSim(), set: () => vSet(), epa: () => vEpa(), epl: () => vEpl() };
+const todoCount = acc => DB.mouvements.filter(o => o.compte === acc && !o.type).length;
+function render() {
+  refreshNow();
+  if (!DB.comptes.find(a => a.id === UI.acc) && DB.comptes.length) UI.acc = accs()[0].id;
+  $('foot').textContent = 'Le 31 · V' + APP_VERSION;
+  const tabOf = { cal: 'plus', sim: 'plus', set: 'plus', epa: 'plus', epl: 'plus' }[UI.tab] || UI.tab;
+  document.querySelectorAll('nav.tabs button').forEach(b => b.setAttribute('aria-current', b.dataset.tab === tabOf));
+  const blocked = BK.view === 'retour' ? null : gate();
+  const bkv = !blocked && (BK.view || (bkPend() ? 'map' : null));
+  $('tabs').hidden = !!blocked || !!bkv;
+  $('accSeg').hidden = !!blocked || !!bkv || accs().length < 2 || ['plus', 'set', 'epl'].includes(UI.tab);
+  $('accSeg').innerHTML = accs().map(a => { const n = UI.tab === 'todo' ? todoCount(a.id) : 0; return `<button data-acc="${esc(a.id)}" aria-pressed="${a.id === UI.acc}">${esc(shortAcc(a.id))}${UI.tab === 'todo' ? ' · ' + n : ''}</button>`; }).join('');
+  const nb = accs().reduce((a, x) => a + todoCount(x.id), 0), bd = $('todoBadge'); if (bd) { bd.textContent = nb; bd.hidden = !nb; }
+  try { main.innerHTML = blocked || (bkv ? vBank() : (VIEWS[UI.tab] || VIEWS.home)()); }
+  catch (e) { console.error(e); main.innerHTML = `<section class="view"><div class="note bad">Un problème d'affichage est survenu : ${esc(e.message)}. Recharge l'appli.</div></section>`; }
+  setSync(); bankChip();
+}
+// Écrans bloquants : appli pas encore reliée, lien refusé, accès coupé, premier chargement, premier lancement
+function gate() {
+  const logo = `<div class="logo31">Le 31<span>.</span></div>`;
+  const paste = `<form class="form" id="keyForm" novalidate style="text-align:left"><div class="field"><label for="keyIn">Colle ici le lien reçu</label><input id="keyIn" placeholder="https://…#inv=…" autocomplete="off"></div><button class="btn" type="submit">Relier l'appli</button></form>`;
+  if (INV() && apiOk()) {
+    if (IOS && !STANDALONE() && !JOIN.iosOk) return `<section class="view center">${logo}<h2>Installe d'abord Le 31</h2>
+      <p class="hint" style="font-size:14px">Sur iPhone et iPad : bouton <b>Partager</b> puis <b>Sur l'écran d'accueil</b>. Ouvre ensuite Le 31 depuis l'écran d'accueil : si l'appli te le demande, colle le lien reçu.</p>
+      <p class="hint">Ce lien ne marche qu'une fois, sur un seul appareil.</p><button class="btn ghost" data-iosok="1">Utiliser Le 31 dans Safari plutôt</button></section>`;
+    const E = JOIN.err;
+    if (!JOIN.busy && E) {
+      const api = API(), short = api.replace(/^https:\/\/script\.google\.com\/macros\/s\/(.{6}).*(.{6})\/exec$/, '…/s/$1…$2/exec');
+      const why = E === 'delai' ? "Le serveur n'a pas répondu à temps." : E === 'reseau' ? "Impossible de joindre le serveur (réseau, ou adresse du serveur incorrecte dans le lien)."
+        : E === 'html' ? "L'adresse du serveur contenue dans le lien ne répond pas comme prévu (déploiement pas en « Tout le monde » ?)." : E === 'serveur' ? 'Le serveur a rencontré une erreur.' : 'Erreur : ' + esc(E);
+      return `<section class="view center">${logo}<h2>Connexion impossible</h2><p class="hint" style="font-size:14px">${why}</p>
+        ${JOIN.detail ? `<div class="note" style="text-align:left;font-size:12px;word-break:break-word">Détail : ${esc(JOIN.detail)}</div>` : ''}
+        <div class="note" style="text-align:left;font-size:13px">Adresse du serveur dans ton lien :<br><b style="word-break:break-all">${esc(short)}</b></div>
+        <button class="btn" data-joinretry="1">Réessayer</button>${paste}</section>`;
+    }
+    return `<section class="view center">${logo}<p class="hint">Connexion de cet appareil…</p></section>`;
+  }
+  if (!JETON() || !apiOk() || isAccessErr(SYNC.error)) {
+    const E = JOIN.err, cut = isAccessErr(SYNC.error) && JETON();
+    const msg = E === 'utilisee' ? "Ce lien a déjà servi : chaque lien ne marche qu'une fois. Demande un nouveau lien." : E === 'expiree' ? 'Ce lien a expiré (14 jours). Demande-en un nouveau.'
+      : E === 'annulee' ? 'Ce lien a été remplacé par un plus récent : utilise le dernier lien reçu.' : E === 'reseau' ? 'Pas de réseau : réessaie dès que possible.' : E ? 'Lien non reconnu.'
+      : cut ? "L'accès de cet appareil a été coupé. Demande un nouveau lien pour le reconnecter." : "Ouvre le lien d'accès reçu par message pour relier l'appli à vos comptes.";
+    return `<section class="view center">${logo}<h2>${cut ? 'Accès coupé' : E ? 'Lien refusé' : 'Bienvenue'}</h2><p class="hint" style="font-size:14px">${msg}</p>${paste}</section>`;
+  }
+  if (!LOADED) return `<section class="view center">${logo}<p class="hint">${SYNC.state === 'off' ? 'Pas de réseau pour le premier chargement. Réessaie dès que possible.' : 'Chargement des comptes…'}</p>${SYNC.state === 'off' ? '<button class="btn ghost" data-retry="1">Réessayer</button>' : ''}</section>`;
+  if (ME === '') return vOnboard();
+  if (!DB.comptes.length) return `<section class="view center">${logo}<p class="hint">Aucun compte visible pour ce profil.</p></section>`;
+  return null;
+}
+
+/* ----- Outils d'affichage ----- */
+const money = v => `<span class="mono">${sgn(v)}</span>`;
+const nbM = v => (v < -0.004 ? '−' : '') + eur(Math.abs(v)).replace(/\s?€/, '');
+const sgnN = v => (v < -0.004 ? '− ' : '+ ') + eur(Math.abs(v)).replace(/\s?€/, '');
+const sgnM = v => sgnN(v) + ' €';
+// V3.2 : couleurs (réglables par compte : seuil du vert en €, marge du rythme des budgets en points)
+const colSet = acc => Object.assign({ seuil: 100, marge: 10 }, regJ(acc, 'couleurs') || {});
+const tone = (acc, v) => v < -0.004 ? 'bad' : v < colSet(acc).seuil - 0.004 ? 'warn' : 'good';
+const evTone = v => v < -0.004 ? 'bad' : 'good';
+const cycEl = c => { const n = dDiff(c.debut, c.fin) + 1, k = Math.max(0, Math.min(n, dDiff(c.debut, TODAY_ISO) + 1)); return { n, k, pct: Math.round(100 * k / n) }; };
+const budTone = (acc, spent, bud, elPct) => spent > bud + 0.004 ? 'bad' : bud > 0 && 100 * spent / bud > elPct + colSet(acc).marge ? 'warn' : 'good';
+const eurM = v => (v < -0.004 ? '− ' : '') + eur(Math.abs(v)).replace(/\s?€/, '') + ' €';
+const selCycle = acc => (UI.cyc[acc] && cycleByMois(acc, UI.cyc[acc])) || curCycle(acc);
+function cycNav(acc, c) {
+  const cy = cyclesOf(acc), cur = curCycle(acc);
+  const prev = c.i > 0, next = c.i < Math.min(cy.length - 1, cur.i + 11);
+  return `<div class="cycnav"><button class="nb" data-cyc="-1" ${prev ? '' : 'disabled'} aria-label="Cycle précédent">‹</button>
+    <div class="cyct"><b>Cycle ${deMois(c.mois)}${pm(c.mois).y !== pm(labelMonth(TODAY_ISO)).y ? ' ' + pm(c.mois).y : ''}</b><span class="mono">${fmtJ(c.debut)} → ${fmtJ(c.fin)}${c.debut <= TODAY_ISO && TODAY_ISO <= c.fin ? ` · J${dDiff(c.debut, TODAY_ISO) + 1}/${dDiff(c.debut, c.fin) + 1}` : ''}</span></div>
+    <button class="nb" data-cyc="1" ${next ? '' : 'disabled'} aria-label="Cycle suivant">›</button></div>`;
+}
+const progBar = c => { const n = dDiff(c.debut, c.fin) + 1, k = Math.max(0, Math.min(n, dDiff(c.debut, TODAY_ISO) + 1)); return `<div class="prog"><i style="width:${Math.round(100 * k / n)}%"></i></div>`; };
+
+/* ----- Démarrage du suivi d'un compte ----- */
+// Pré-remplissage facultatif du démarrage (window.LE31_PREFILL, absent de l'appli livrée : utilisé par les tests).
+// Forme : { label, perso: { qui (regex du prénom), debut, montant, jour, budgets, cats, dates, prevues, epargne, primes }, commun: { … } }
+const PREFILL = (typeof window !== 'undefined' && window.LE31_PREFILL) || null;
+const EPA_DEF = { perso: [['Livret A', 'livret'], ['LDD', 'livret'], ['Investissement', 'invest']], commun: [['Livret commun', 'livret']] };
+const CATS_DEF = ['Courses', 'Carburant', 'Restaurants', 'Loisirs', 'Shopping', 'Santé', 'Abonnement', 'Crédit', 'Épargne', 'Divers'];
+const excelFor = acc => (PREFILL && PREFILL[isPerso(acc) ? 'perso' : 'commun']) || null;
+const excelLikely = acc => { const X = excelFor(acc); return !!X && (!isPerso(acc) || !X.qui || new RegExp(X.qui, 'i').test(pname(accOf(acc).proprietaire))); };
+function defStart(acc) {
+  const j = 26, d = TODAY >= j ? CUR + '-' + j : addM(CUR, -1) + '-' + j, X = excelFor(acc);
+  return excelLikely(acc) && X.debut && labelMonth(X.debut) === labelMonth(d) ? X.debut : d;
+}
+function vStart(acc) {
+  const P = isPerso(acc), X = excelFor(acc), ex = excelLikely(acc), bk = !!bkRow(acc), f = UI.startAcc[acc] || {};
+  return `<section class="view">${bankBanners(acc)}<div class="hero" style="gap:14px">
+    <div class="rowhead"><h2>Démarrer le suivi · ${esc(shortAcc(acc))}</h2></div>
+    <p class="hint" style="font-size:13px;margin:0">Le 31 suit ce compte par cycles : ${P ? 'du jour du salaire à la veille du suivant' : "de l'arrivée du virement de début de cycle à la veille du suivant"}. ${bk ? 'La banque est lue à partir du début du cycle (rien avant) et toutes les opérations arrivent dans « À classer ».' : ''}</p>
+    <form class="form" id="startForm" data-acc="${esc(acc)}" novalidate>
+      <div class="field"><label for="stD">${P ? 'Début du cycle en cours (jour du salaire)' : 'Début du cycle en cours (arrivée du virement)'}</label><input type="date" id="stD" value="${esc(f.debut || defStart(acc))}" max="${TODAY_ISO}"></div>
+      ${P ? '' : `<div class="field"><label for="stN">Nom de ce virement</label><input id="stN" value="${esc(f.nom || (ex ? X.nom : ''))}" placeholder="Ex. Virement du conjoint"></div>`}
+      <div class="two"><div class="field"><label for="stM">${P ? 'Salaire net habituel (€)' : 'Montant habituel (€)'}</label><input id="stM" inputmode="decimal" value="${esc(f.montant != null ? f.montant : ex ? fr(X.montant) : '')}"></div>
+      <div class="field"><label for="stJ">Jour habituel</label><input id="stJ" inputmode="numeric" value="${esc(f.jour || 26)}"></div></div>
+      ${bk ? `<label class="check"><input type="checkbox" id="stBk" checked><span><b>Solde de départ lu à la banque</b><br><small class="mini">Recommandé : solde de la banque moins les opérations depuis le début du cycle.</small></span></label>` : ''}
+      <div class="field" id="stSWrap" ${bk ? 'hidden' : ''}><label for="stS">Solde juste avant ${P ? 'le salaire' : 'le virement'} (€)</label><input id="stS" inputmode="decimal" placeholder="Ex. 0,00"></div>
+      ${ex ? `<label class="check"><input type="checkbox" id="stX" checked><span><b>${esc(PREFILL.label || 'Pré-remplir')}</b><br><small class="mini">Budgets, dates et prévues proposés. Les charges fixes viennent de ton classement.</small></span></label>` : ''}
+      <button class="btn" type="submit" ${BK.busy ? 'disabled' : ''}>${BK.busy ? '<span class="spin"></span> Lecture de la banque…' : 'Démarrer'}</button>
+    </form></div></section>`;
+}
+async function startAccount(acc) {
+  const d = $('stD').value, m = num($('stM').value), j = Math.min(31, Math.max(1, num($('stJ').value) || 26));
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(d) || d > TODAY_ISO) { toast('Indique la date de début du cycle (passée)'); return; }
+  const bk = $('stBk') && $('stBk').checked, s = num($('stS').value);
+  if (!bk && s === null) { toast('Indique le solde de départ'); return; }
+  const S = { debut: d, mois: labelMonth(d), montant: m === null ? '' : r2(m), jour: j };
+  const ops = [isPerso(acc) ? regOp(acc, 'v3', S) : upd('Parametres', { cle: 'v3|' + acc, valeur: JSON.stringify(S) })];
+  if (isPerso(acc) && !DB.reglages.some(r => r.id === acc + '|salaire')) ops.push(regOp(acc, 'salaire', defaultPlan(acc, $('stX') && $('stX').checked)));
+  if ($('stN') && $('stN').value.trim()) ops.push(upd('Parametres', { cle: 'v3nomrev|' + acc, valeur: $('stN').value.trim() }));
+  ops.push(upd('Cycles', { id: acc + '|' + S.mois, compte: acc, mois: S.mois, debut: d, montant: S.montant, soldeDepart: bk ? '' : r2(s), manuel: bk ? '' : 's' }));
+  const X = $('stX') && $('stX').checked ? excelFor(acc) : null;
+  let ordre = Math.max(0, ...budgetsOf(acc).map(b => num(b.ordre) || 0));
+  const have = new Set(budgetsOf(acc).map(b => b.nom.toLowerCase()));
+  const addB = (nom, bud) => { if (have.has(nom.toLowerCase())) { const b = budgetsOf(acc).find(x => x.nom.toLowerCase() === nom.toLowerCase()); if (bud) ops.push(upd('Budgets', { id: b.id, budget: bud })); return; } have.add(nom.toLowerCase()); ops.push(upd('Budgets', { id: uid(), compte: acc, nom, budget: bud || '', ordre: ++ordre })); };
+  if (X) {
+    X.budgets.forEach(([n, b]) => addB(n, b)); X.cats.forEach(n => addB(n, ''));
+    Object.entries(X.dates).forEach(([k, dt]) => { if (k > S.mois) ops.push(upd('Cycles', { id: acc + '|' + k, compte: acc, mois: k, debut: dt, montant: '', soldeDepart: '', manuel: '' })); });
+    X.prevues.forEach(([dt, l, v, c]) => { if (dt >= d) ops.push(upd('Prevues', { id: uid(), compte: acc, date: dt, libelle: l, montant: v, categorie: c, etat: '', lien: '' })); });
+  } else if (!budgetsOf(acc).length) CATS_DEF.forEach(n => addB(n, ''));
+  commit(ops);
+  UI.startAcc[acc] = null; UI.cyc[acc] = null;
+  if (bk) { await bankSync({ force: true, start: { [acc]: S } }); if (!num((DB.cycles.find(c => c.id === acc + '|' + S.mois) || {}).soldeDepart) && (DB.cycles.find(c => c.id === acc + '|' + S.mois) || {}).soldeDepart === '') toast('Solde de la banque indisponible : saisis le solde de départ dans Calendrier salaires'); }
+  toast('Suivi démarré'); render();
+}
+
+/* ----- Accueil ----- */
+function vHome() {
+  const acc = UI.acc; if (!started3(acc)) return vStart(acc);
+  const c = selCycle(acc), R = cycleCalc(acc, c), nTodo = todoCount(acc);
+  const bigLbl = R.isCur ? 'Solde actuel' : R.isPast ? 'Solde de fin (réel)' : 'Solde de départ (projeté)';
+  const bigV = R.isCur ? R.soldeActuel : R.isPast ? R.realEnd : R.depart;
+  return `<section class="view">${bankBanners(acc)}
+    <div class="block">${cycNav(acc, c)}${R.isCur ? progBar(c) : ''}</div>
+    <div class="bigsolde"><small>${bigLbl}</small><b class="mono">${eurM(bigV)}</b>${num(c.row.soldeDepart) === null || c.row.soldeDepart === '' ? (c.i === 0 ? '<span class="mini warn">Solde de départ à renseigner (Calendrier salaires)</span>' : '') : ''}</div>
+    <div class="kpis">
+      <div class="kv1"><span>Atterrissage sans budget</span><b class="mono t-${tone(acc, R.atterSans)}">${sgnM(R.atterSans)}</b></div>
+      ${kpiBud(acc, c, R)}
+      <div class="kv1 main ${tone(acc, R.atterAvec)}"><span>Atterrissage avec budget</span><b class="mono">${sgnM(R.atterAvec)}</b></div>
+    </div>
+    ${nTodo ? `<button class="todoline" data-tab="todo"><span><b>${nTodo}</b> opération${nTodo > 1 ? 's' : ''} à classer</span><span>›</span></button>` : ''}
+    ${vJpj(acc, c, R)}
+    ${vMpm(acc)}
+  </section>`;
+}
+// Budget restant : « reste / prévu », barre et repère du jour du cycle
+function kpiBud(acc, c, R) {
+  const B = R.buds, tb = r2(B.reduce((a, x) => a + x.budget, 0)), ts = r2(B.reduce((a, x) => a + x.spent, 0));
+  if (!tb) return `<div class="kv1"><span>Budget restant</span><b class="mono">${eurM(0)}</b></div>`;
+  const E = cycEl(c), elPct = R.isPast ? 100 : R.isFut ? 0 : E.pct, t = budTone(acc, ts, tb, elPct), pc = Math.min(100, Math.round(100 * ts / tb)), nOver = B.filter(x => x.over > 0).length;
+  return `<div class="kvb"><div class="kvt"><span>Budget restant</span><span class="mono"><b class="t-${t}">${nbM(R.reserve)} €</b><em> / ${nbM(tb)} € prévus</em></span></div>
+    <div class="bar"><i class="${t}" style="width:${pc}%"></i>${R.isCur ? `<em style="left:${E.pct}%"></em>` : ''}</div>
+    <div class="kvs"><span>${eurM(ts)} dépensés (${Math.round(100 * ts / tb)} %)${nOver ? ` · <b class="t-bad">${nOver} dépassé${nOver > 1 ? 's' : ''}</b>` : ''}</span><span>${R.isCur ? `repère : J${E.k}/${E.n} = ${E.pct} %` : R.isFut ? 'cycle à venir' : 'cycle terminé'}</span></div></div>`;
+}
+// V3.2 : du plus récent au plus ancien (fin de cycle en haut, aujourd'hui, puis le passé jusqu'au départ)
+function vJpj(acc, c, R) {
+  const rows = []; let marked = !R.isCur;
+  const todayMark = `<div class="todaymark"><i></i>AUJOURD'HUI · <span class="mono">${eurM(R.soldeActuel)}</span><i></i></div>`;
+  R.days.slice().reverse().forEach(dd => {
+    if (!marked && dd.d <= TODAY_ISO) { rows.push(todayMark); marked = true; }
+    if (!dd.items.length && !UI.jpjAll) return;
+    const fut = dd.d > TODAY_ISO, l = dd.items, one = l.length === 1 ? l[0] : null, allPrev = l.length && l.every(x => !x.real);
+    const lab = !l.length ? '<span class="mini">—</span>' : one ? `${esc(one.label)}${one.real ? (one.kind === 'todo' ? ' <span class="tag w">à classer</span>' : '') : ` <span class="tag g">${one.late ? 'pas encore vu' : 'prévu'}</span>`}`
+      : `${l.length} mouvements${allPrev ? ' <span class="tag g">prévu</span>' : ''}<small>${l.map(x => `${esc(x.label)} ${eurM(x.v).replace('− ', '−')}`).join(' · ')}</small>`;
+    rows.push(`<div class="dayrow ${fut || allPrev ? 'fut' : ''}"><span class="mono dd">${wd(dd.d)} ${fmtJ(dd.d)}</span><span class="dl">${lab}</span><span class="mono dv">${l.length ? `<span class="${dd.mv > 0 ? 'pos' : ''}">${sgn(dd.mv)}</span>` : ''}<small>${eurM(dd.bal)}</small></span></div>`);
+  });
+  if (!marked) rows.push(todayMark);
+  const finV = R.isPast ? R.realEnd : R.atterSans;
+  return `<details class="jpj" id="jpj" ${UI.jpj ? 'open' : ''}><summary>Jour par jour<svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M6 9l6 6 6-6"/></svg></summary>
+    <div class="mini" style="margin:-4px 0 8px">Du plus récent au plus ancien · solde après chaque jour</div>
+    <div class="jpjend"><span>Fin de cycle · ${wd(c.fin)} ${fmtJ(c.fin)}<small>${R.isPast ? 'réel' : 'sans budget'}</small></span><b class="mono t-${tone(acc, finV)}">${sgnM(finV)}</b></div>
+    ${rows.join('')}
+    <div class="dayfoot"><span>Départ · ${wd(c.debut)} ${fmtJ(c.debut)}</span><span class="mono">${eurM(R.depart)}</span></div>
+    <button class="linkbtn" data-jpjall="1">${UI.jpjAll ? 'Masquer les jours sans mouvement' : 'Afficher aussi les jours sans mouvement'}</button></details>`;
+}
+
+/* ----- À classer ----- */
+function vTodo() {
+  const acc = UI.acc; if (!started3(acc)) return vStart(acc);
+  const list = DB.mouvements.filter(o => o.compte === acc && !o.type).sort((a, b) => a.date.localeCompare(b.date) || a.id.localeCompare(b.id));
+  const c = curCycle(acc), S = v3(acc);
+  const autos = DB.mouvements.filter(o => o.compte === acc && o.auto === '1' && o.date >= (c ? c.debut : '')).sort((a, b) => b.date.localeCompare(a.date));
+  if (!list.some(o => o.id === UI.td.id)) UI.td = list.length ? { id: list[0].id } : {};
+  const first = c && c.i === 0;
+  return `<section class="view">
+    <div class="rowhead"><h2 class="title">À classer</h2><span class="mono mini">${list.length} opération${list.length > 1 ? 's' : ''}</span></div>
+    <p class="hint" style="font-size:13px;margin:-8px 0 0">${first ? `Opérations reçues de la banque depuis le début du cycle ${deMois(S.mois)} (${fmtJ(S.debut)}). Elles comptent déjà dans le solde ; il reste à dire ce qu'elles sont. Ce que tu classes ce mois-ci sert ensuite à classer tout seul.` : 'Le reste a été classé tout seul d\'après tes choix. Ici, seulement les cas de doute et les nouveaux marchands.'}</p>
+    ${list.length ? list.map(o => o.id === UI.td.id ? todoCard(o) : todoRow(o)).join('') : '<div class="note good">Rien à classer.</div>'}
+    ${autos.length ? `<div class="rowhead" style="margin-top:6px"><span class="sublbl">Classées automatiquement · ${autos.length}</span></div>
+      <div class="list">${autos.slice(0, UI.autoAll ? 999 : 6).map(o => `<button class="item" data-oid="${esc(o.id)}" style="grid-template-columns:1fr auto"><span class="lbl"><b>${esc(nameOf(o))}<span class="tag g">AUTO</span></b><small>${fmtJ(o.date)} · ${esc(o.type === 'fixe' ? 'fixe ✓' + (o.categorie ? ' · ' + o.categorie : '') : o.type === 'sal' ? 'début du cycle · Calendrier' : o.categorie || TYPES[o.type])}</small></span><span class="amt ${num(o.montant) > 0 ? 'pos' : ''}">${sgn(num(o.montant))}</span></button>`).join('')}</div>
+      ${autos.length > 6 ? `<button class="linkbtn" data-autoall="1">${UI.autoAll ? 'Moins' : 'Tout voir'}</button>` : ''}
+      <p class="hint">Touche une ligne pour la corriger : la règle est corrigée pour les mois suivants.</p>` : ''}
+  </section>`;
+}
+function todoRow(o) {
+  const s = suggest(o), v = num(o.montant) || 0;
+  return `<div class="todorow"><div class="tl"><b>${esc(o.libelle)}</b><span class="mono mini">${wd(o.date)} ${fmtJ(o.date)}</span>${s && s.why ? `<span class="sug">${esc(s.why)}</span>` : s && s.kind === 'fixe' ? `<span class="sug">Fixe « ${esc(s.r.libelle)} » ?</span>` : s && s.kind === 'epargne' ? `<span class="sug">Épargne · ${livName(livOf(s.livret))} ?</span>` : ''}</div>
+    <div class="tr"><span class="mono ${v > 0 ? 'pos' : ''}">${sgn(v)}</span><span class="qb2"><button class="qb" data-tsel="${esc(o.id)}" data-tk="ponct">Ponctuel</button>${s && s.kind === 'epargne' ? `<button class="qb" data-tsel="${esc(o.id)}" data-tk="epargne">Épargne</button>` : `<button class="qb" data-tsel="${esc(o.id)}" data-tk="${v > 0 && !s ? 'sal' : 'fixe'}">${v > 0 && !s ? 'Revenu' : 'Fixe'}</button>`}</span></div></div>`;
+}
+function todoCard(o) {
+  const acc = o.compte, v = num(o.montant) || 0, s = suggest(o), T = UI.td;
+  const Ls = livretsOf(acc);
+  if (T.liv === undefined) T.liv = s && s.kind === 'epargne' ? s.livret : ((Ls.find(L => NORM(o.libelle || '').includes(NORM(L.nom))) || {}).id || '');
+  if (!T.kind) T.kind = s && (s.kind === 'fixe' || s.kind === 'sal' || s.kind === 'prime' || s.kind === 'epargne') ? s.kind : T.liv && Ls.length ? 'epargne' : 'ponct';
+  if (T.cat === undefined) T.cat = s && s.kind === 'ponct' && s.cats.length === 1 ? s.cats[0] : s && s.kind === 'fixe' ? (s.r.categorie || '') : (ruleOf3(acc, skOf(o)) || {}).categorie && !String(ruleOf3(acc, skOf(o)).categorie).includes('|') ? ruleOf3(acc, skOf(o)).categorie : '';
+  if (T.rec === undefined) T.rec = s && s.kind === 'fixe' ? s.r.id : '';
+  const cats = catNames(acc), recs = DB.recurrents.filter(r => r.compte === acc && bool(r.actif) && (r.sens === '+') === (v > 0));
+  const kinds = [['ponct', 'Ponctuel'], ['fixe', 'Fixe']].concat(v > 0 ? [['sal', isPerso(acc) ? 'Salaire' : 'Début de cycle']] : []).concat(Ls.length ? [['epargne', 'Épargne']] : []).concat(s && s.kind === 'prime' ? [['prime', 'Prime']] : []);
+  const rule = ruleOf3(acc, skOf(o));
+  let sugg = '';
+  if (s && s.kind === 'fixe') sugg = `<div class="sug">Fixe « ${esc(s.r.libelle)} » ?${s.why ? ' ' + esc(s.why) : ''}</div>`;
+  else if (s && s.kind === 'sal') sugg = `<div class="sug">${esc(salLabel(acc))} ?${s.why ? ' ' + esc(s.why) : ''}</div>`;
+  else if (s && s.kind === 'prime') sugg = `<div class="sug">${esc(s.p.nom)} du ${fmtJ(s.p.date)} ?</div>`;
+  else if (s && s.kind === 'epargne') sugg = `<div class="sug">Épargne · ${livName(livOf(s.livret))} ?</div>`;
+  else if (s && s.why) sugg = `<div class="sug">${esc(s.why)}</div>`;
+  const chips = `<div class="chips" id="tdCats">${cats.map(n => `<button type="button" class="chip" data-tcat="${esc(n)}" aria-pressed="${T.cat === n}">${esc(n)}</button>`).join('')}<button type="button" class="chip" data-tcat="__new" aria-pressed="${T.cat === '__new'}">+ Nouvelle</button></div>
+    <input id="tdCatNew" placeholder="Nouvelle catégorie" ${T.cat === '__new' ? '' : 'hidden'} value="${esc(T.catNew || '')}">`;
+  let body = '';
+  if (T.kind === 'ponct') body = `<div class="field"><label for="tdNom">Nom</label><input id="tdNom" value="${esc(T.nom != null ? T.nom : nameOf(o))}"></div>
+    <div class="field"><label>Catégorie</label>${chips}</div>
+    ${s && s.why && s.cats && s.cats.length > 1 ? `<button type="button" class="linkbtn" data-seuil="${esc(o.id)}">Séparer ce marchand par montant…</button>` : ''}`;
+  else if (T.kind === 'fixe') {
+    const nr = T.rec === '' || !recOf(T.rec);
+    body = `<div class="field"><label for="tdRec">Charge fixe</label><select id="tdRec">${recs.map(r => `<option value="${esc(r.id)}" ${r.id === T.rec ? 'selected' : ''}>${esc(r.libelle)} · le ${esc(r.jour)} · ${eurM(num(r.montant))}</option>`).join('')}<option value="" ${nr ? 'selected' : ''}>Nouvelle charge fixe…</option></select></div>
+    ${nr ? `<div class="field"><label for="tdNom">Nom</label><input id="tdNom" value="${esc(T.nom != null ? T.nom : nameOf(o))}"></div>
+      <div class="two"><div class="field"><label for="tdJour">Jour du mois</label><input id="tdJour" inputmode="numeric" value="${esc(T.jour || +o.date.slice(8, 10))}"></div><div class="field"><label for="tdMt">Montant habituel (€)</label><input id="tdMt" inputmode="decimal" value="${esc(T.mt != null ? T.mt : fr(Math.abs(v)))}"></div></div>` : ''}
+    ${nr && v < 0 ? livSelect(acc, T.liv, 'tdLiv') : ''}
+    <div class="field"><label>Catégorie</label>${chips}</div>`;
+  } else if (T.kind === 'epargne') {
+    body = `<div class="field"><label>${v < 0 ? 'Versement vers' : 'Retrait depuis'}</label><div class="chips">${Ls.map(L => `<button type="button" class="chip" data-tliv="${esc(L.id)}" aria-pressed="${T.liv === L.id}">${livName(L)}</button>`).join('')}</div></div>
+      <div class="hint">${v < 0 ? 'Le livret augmente de ' + eurM(-v) : 'Le livret baisse de ' + eurM(v) + ', ton compte monte'}. Pour un virement qui revient chaque mois, choisis plutôt « Fixe » et lie-le au livret : il sera reconnu seul ensuite.</div>`;
+  } else if (T.kind === 'prime') {
+    body = `<div class="note">Reconnue comme <b>${esc(s.p.nom)}</b> du ${fmtJA(s.p.date)} (attendu ${eurM(s.p.v)}), réglée dans Calendrier salaires → Évolution du salaire.</div>`;
+  } else {
+    const k = labelMonth(o.date);
+    body = `<div class="note">Début du cycle ${deMois(k)} le <b>${fmtJ(o.date)}</b>, montant <b>${eurM(v)}</b> : repris dans le Calendrier salaires${(cycleByMois(acc, k) || { man: '' }).man.includes('d') ? ' (sauf la date, saisie à la main)' : ''}.</div>`;
+  }
+  return `<form class="todocard" id="todoForm" data-id="${esc(o.id)}" novalidate>
+    <div class="rowhead"><div class="tl"><b>${esc(o.libelle)}</b><span class="mono mini">${wd(o.date)} ${fmtJ(o.date)}</span></div><span class="mono amt ${v > 0 ? 'pos' : ''}">${sgn(v)}</span></div>
+    ${sugg}
+    <div class="seg seg${kinds.length}">${kinds.map(([k, l]) => `<button type="button" data-tkind="${k}" aria-pressed="${T.kind === k}">${l}</button>`).join('')}</div>
+    ${body}
+    <label class="check"><input type="checkbox" id="tdAsk" ${rule && rule.type === 'ask' ? 'checked' : ''}><span class="mini">Toujours me demander pour ce marchand</span></label>
+    <button class="btn dark" type="submit">Classer</button>
+  </form>`;
+}
+function readTodo(o) {
+  const T = UI.td, h = { type: T.kind, ask: $('tdAsk') ? $('tdAsk').checked : undefined };
+  let cat = T.cat || ''; if (cat === '__new') cat = ($('tdCatNew') ? $('tdCatNew').value : '').trim();
+  h.categorie = cat;
+  if (T.kind === 'ponct') { h.nom = $('tdNom') ? $('tdNom').value.trim() : ''; if (h.nom === smartName(o.libelle || '')) h.nom = ''; }
+  if (T.kind === 'fixe') {
+    h.recId = $('tdRec') ? $('tdRec').value : '';
+    if (!h.recId) h.newRec = { libelle: ($('tdNom').value || '').trim() || nameOf(o), jour: num($('tdJour').value), montant: num($('tdMt').value), livret: $('tdLiv') ? $('tdLiv').value : '' };
+  }
+  if (T.kind === 'epargne') { h.livret = T.liv || ''; h.categorie = 'Épargne'; }
+  if (T.kind === 'prime') { const s = suggest(o); if (s && s.kind === 'prime') { h.key = s.p.key; h.nom = s.p.nom; } }
+  return h;
+}
+function keepTodoInputs() {
+  const T = UI.td;
+  if ($('tdNom')) T.nom = $('tdNom').value; if ($('tdJour')) T.jour = $('tdJour').value; if ($('tdMt')) T.mt = $('tdMt').value;
+  if ($('tdRec')) T.rec = $('tdRec').value; if ($('tdCatNew')) T.catNew = $('tdCatNew').value; if ($('tdLiv')) T.liv = $('tdLiv').value;
+}
+
+/* ----- Transactions (Ponctuels | Fixes) ----- */
+function vTx() {
+  const acc = UI.acc; if (!started3(acc)) return vStart(acc);
+  const c = selCycle(acc), R = cycleCalc(acc, c);
+  const tabs = `<div class="ultabs"><button data-txtab="ponct" aria-pressed="${UI.txTab === 'ponct'}">Ponctuels</button><button data-txtab="fixe" aria-pressed="${UI.txTab === 'fixe'}">Fixes</button></div>`;
+  const head = (btn) => `<div class="rowhead"><h2 class="title">Transactions</h2>${btn}</div>${tabs}`;
+  if (UI.txTab === 'fixe') return vFixes(acc, c, R, head(`<button class="btn small pill2" data-newrec="1">＋ Ajouter</button>`));
+  const prev = DB.prevues.filter(p => p.compte === acc && !p.etat).sort((a, b) => a.date.localeCompare(b.date));
+  const done = DB.prevues.filter(p => p.compte === acc && p.etat).sort((a, b) => b.date.localeCompare(a.date)).slice(0, 5);
+  let body;
+  if (UI.txSeg === 'prev') body = `<div class="list">${prev.length ? prev.map(p => `<button class="item" data-pid="${esc(p.id)}" style="grid-template-columns:62px 1fr auto"><span class="day">${fmtJ(p.date)}</span><span class="lbl"><b><i>${esc(p.libelle)}</i></b><small>${esc(p.categorie || '')} · prévu${p.date <= TODAY_ISO ? ' (pas encore vu)' : ''}</small></span><span class="amt ${num(p.montant) > 0 ? 'pos' : ''}">${sgn(num(p.montant))}</span></button>`).join('') : '<div class="empty">Aucune opération prévue.</div>'}</div>
+    ${done.length ? `<div class="sublbl">Réalisées</div><div class="list">${done.map(p => `<button class="item off" data-pid="${esc(p.id)}" style="grid-template-columns:62px 1fr auto"><span class="day">${fmtJ(p.date)}</span><span class="lbl"><b>${esc(p.libelle)}</b><small>réalisée</small></span><span class="amt">${sgn(num(p.montant))}</span></button>`).join('')}</div>` : ''}
+    <p class="hint">Une prévue compte dans l'atterrissage. Elle passe en réalisée quand la banque la remonte (même montant à ± 4 jours) ou d'un geste.</p>`;
+  else {
+    const l = R.real.filter(o => o.type === 'ponct' || o.type === 'ajust' || !o.type).sort((a, b) => b.date.localeCompare(a.date) || b.id.localeCompare(a.id));
+    const tot = r2(l.filter(o => o.type === 'ponct').reduce((a, o) => a + (num(o.montant) || 0), 0));
+    const groups = {}; l.forEach(o => (groups[o.date] = groups[o.date] || []).push(o));
+    body = `<div class="sumline"><span>Ponctuel du cycle</span><b class="mono">${sgn(tot)}</b></div>
+      ${l.length ? `<div class="list">${Object.keys(groups).map(d => `<div class="grp">${wd(d).toUpperCase()} ${dLong(d).toUpperCase()}</div>` + groups[d].map(o => `<button class="item" data-oid="${esc(o.id)}" style="grid-template-columns:1fr auto"><span class="lbl"><b>${esc(nameOf(o))}${!o.type ? '<span class="tag w">à classer</span>' : ''}${o.auto === '1' ? '<span class="tag g">AUTO</span>' : ''}</b><small>${esc(o.type === 'ajust' ? 'Correction' : o.categorie || '—')}${o.ref ? ' · banque' : ' · saisie'}</small></span><span class="amt ${num(o.montant) > 0 ? 'pos' : ''}">${sgn(num(o.montant))}</span></button>`).join('')).join('')}</div>` : '<div class="empty card0">Aucun ponctuel dans ce cycle.</div>'}`;
+  }
+  return `<section class="view">${head(`<button class="btn small pill2" data-newop="1">＋ Saisir</button>`)}
+    ${cycNav(acc, c)}
+    <div class="chips"><button class="chip" data-txseg="real" aria-pressed="${UI.txSeg === 'real'}">Réalisées</button><button class="chip" data-txseg="prev" aria-pressed="${UI.txSeg === 'prev'}">Prévues · ${prev.length}</button></div>
+    ${body}</section>`;
+}
+function vFixes(acc, c, R, head) {
+  const recs = DB.recurrents.filter(r => r.compte === acc).sort((a, b) => (num(a.jour) || 0) - (num(b.jour) || 0) || a.libelle.localeCompare(b.libelle));
+  let seenN = 0, waitN = 0, tot = 0;
+  const row = r => {
+    const occ = occDates(r, c.debut, c.fin), seen = R.real.filter(o => o.type === 'fixe' && o.lien === r.id), sgnV = r.sens === '+' ? 1 : -1;
+    const sv = seen.reduce((a, o) => a + (num(o.montant) || 0), 0), rest = occ.slice(seen.length);
+    tot += sv + rest.length * sgnV * (num(r.montant) || 0); seenN += seen.length; waitN += rest.length;
+    const st = !bool(r.actif) ? '<span class="mini">arrêtée</span>' : seen.length ? `<span class="ok">✓ vu le ${seen.map(o => fmtJ(o.date)).join(', ')}</span>` : rest.length ? `<span class="mini">${rest[0] <= TODAY_ISO ? 'pas encore vu (prévu le ' + fmtJ(rest[0]) + ')' : 'à venir'}</span>` : '<span class="mini">pas dans ce cycle</span>';
+    return `<button class="item ${!bool(r.actif) ? 'off' : ''}" data-rid="${esc(r.id)}"><span class="day">${pad(num(r.jour) || 1)}</span><span class="lbl"><b>${esc(r.libelle)}</b><small>${st}${r.categorie ? ' · ' + esc(r.categorie) : ''}${r.livret && livOf(r.livret) ? ' · → ' + livName(livOf(r.livret)) : ''}${r.fin ? ' · jusqu\'au ' + fmtJA(r.fin) : ''}</small></span><span class="amt ${r.sens === '+' ? 'pos' : ''}">${r.sens === '+' ? '+' : '−'} ${eurM(num(r.montant) || 0)}</span></button>`;
+  };
+  const ins = recs.filter(r => r.sens === '+'), outs = recs.filter(r => r.sens !== '+');
+  const html = [ins.length ? `<div class="grp">RENTRÉES</div>${ins.map(row).join('')}` : '', outs.length ? `<div class="grp">CHARGES ET VIREMENTS</div>${outs.map(row).join('')}` : ''].join('');
+  return `<section class="view">${head}
+    ${cycNav(acc, c)}
+    <div class="sumline"><span>Fixes du cycle<small>${seenN} vu${seenN > 1 ? 's' : ''} à la banque · ${waitN} à venir</small></span><b class="mono">${sgn(r2(tot))}</b></div>
+    ${recs.length ? `<div class="list">${html}</div>` : '<div class="empty card0">Aucune charge fixe pour l\'instant : elles se créent en classant les opérations (« Fixe »), ou avec « Ajouter ».</div>'}
+    <p class="hint">Le ${isPerso(acc) ? 'salaire' : 'virement de début de cycle'} n'est pas ici : il vient du Calendrier salaires. Une charge vue à la banque est cochée avec son vrai montant ; tant qu'elle n'est pas vue, elle reste « à venir » dans l'atterrissage.</p></section>`;
+}
+
+/* ----- Budgets ----- */
+function vBud() {
+  const acc = UI.acc; if (!started3(acc)) return vStart(acc);
+  const c = selCycle(acc), R = cycleCalc(acc, c), B = R.buds;
+  const tb = r2(B.reduce((a, x) => a + x.budget, 0)), ts = r2(B.reduce((a, x) => a + x.spent, 0)), E = cycEl(c), elPct = R.isPast ? 100 : R.isFut ? 0 : E.pct;
+  const others = budgetsOf(acc).filter(b => !(num(b.budget) > 0));
+  return `<section class="view"><div class="rowhead"><h2 class="title">Budgets</h2></div>
+    ${cycNav(acc, c)}
+    <div class="tiles3"><div><small>Budget</small><b class="mono">${eurM(tb)}</b></div><div><small>Dépensé</small><b class="mono">${eurM(ts)}</b></div><div><small>À réserver</small><b class="mono t-${budTone(acc, ts, tb, elPct)}">${eurM(R.reserve)}</b></div></div>${R.isCur && tb ? `<p class="hint" style="margin:0">Le trait marque le jour du cycle (J${E.k}/${E.n}) : vert tant que tu dépenses à ce rythme, orange si tu vas plus vite, rouge si c'est dépassé.</p>` : ''}
+    <div class="list">${B.length ? B.map(x => { const pc = x.budget ? Math.min(100, Math.round(100 * x.spent / x.budget)) : 0, t = budTone(acc, x.spent, x.budget, elPct);
+      return `<button class="env2" data-bid="${esc(x.b.id)}"><span class="t"><b>${esc(x.nom)}</b><span class="mono">${eurM(x.spent)} / ${eurM(x.budget).replace(',00', '')}</span></span><span class="bar"><i class="${t}" style="width:${x.over ? 100 : pc}%"></i>${R.isCur ? `<em style="left:${E.pct}%"></em>` : ''}</span><span class="mono mini t-${t}">${x.over ? '▲ dépassé de ' + eurM(x.over) : 'reste ' + eurM(x.reste)}</span></button>`; }).join('') : '<div class="empty">Aucun budget.</div>'}</div>
+    <button class="btn dashed" data-newbud="1">+ Ajouter un budget</button>
+    ${others.length ? `<details class="plain"><summary>Catégories sans budget · ${others.length}</summary><div class="list">${others.map(b => `<button class="item" data-bid="${esc(b.id)}" style="grid-template-columns:1fr auto"><span class="lbl"><b>${esc(b.nom)}</b></span><span class="mini">ajouter un budget ›</span></button>`).join('')}</div></details>` : ''}
+    <p class="hint">Les ponctuels classés dans une catégorie budgétée réduisent son reste. Le reste à réserver d'un cycle en cours est déduit de l'atterrissage ; pour un cycle à venir, c'est le budget complet ; un cycle fini ne réserve plus rien.</p></section>`;
+}
+
+/* ----- Plus ----- */
+function vPlus() {
+  const it = (tab, ic, t, s) => `<button class="mitem" data-tab="${tab}"><svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">${ic}</svg><span><b>${t}</b><small>${s}</small></span><span class="ch">›</span></button>`;
+  const bk = bkOn() && bkLinked().length;
+  return `<section class="view"><h2 class="title">Plus</h2>
+    <div class="sublbl">PILOTAGE</div><div class="list">
+      ${it('cal', '<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M3 10h18M8 3v4M16 3v4"/>', 'Calendrier salaires', 'Cycles, augmentations, primes')}
+      ${it('epa', '<path d="M4 10h16v10H4z"/><path d="M12 4l8 6H4z"/><path d="M12 13v4M9.5 15h5"/>', 'Épargne', 'Livrets et investissement, objectifs du mois')}
+      ${it('sim', '<path d="M3 20h18M6 16v-5M11 16V7M16 16v-3M21 4l-5 5"/>', 'Simulation', 'Tester un achat ou un crédit')}
+    </div>
+    <div class="sublbl">RÉGLAGES</div><div class="list">
+      ${it('set', '<path d="M3 10l9-6 9 6M5 10v9M19 10v9M9 10v9M15 10v9M3 21h18"/>', 'Connexion bancaire, comptes, profils', bk ? '<span class="ok">✓ Banque reliée</span>' : 'Banque, accès, apparence')}
+    </div>
+    <p class="mono mini" style="text-align:center;margin-top:10px">Le 31 · V${APP_VERSION}</p></section>`;
+}
+const backPlus = `<button class="back" data-tab="plus">‹ Plus</button>`;
+
+/* ----- Calendrier salaires ----- */
+function vCal() {
+  const acc = UI.acc; if (!started3(acc)) return backPlus + vStart(acc);
+  if (isPerso(acc) && UI.calTab === 'evo') return vEvo(acc);
+  const cy = cyclesOf(acc), cur = curCycle(acc), P = isPerso(acc), S = v3(acc);
+  const rows = cy.slice(0, cur.i + 12).map(c => {
+    const R = cycleCalc(acc, c), isC = c.i === cur.i, k = departKind(c);
+    const banque = c.sal ? `<span class="ok">✓ vu à la banque${c.man.includes('d') && c.sal.date !== c.debut ? ' le ' + fmtJ(c.sal.date) : ''}</span>` : c.debut > TODAY_ISO ? (c.row.debut ? '' : 'estimé') : c.i === 0 ? '' : '<span class="warnt">pas encore vu</span>';
+    const xtra = [c.detail.rappel ? `+${c.detail.hausse} % et rattrapage` : '', ...c.detail.primes.map(p => '+ ' + p.nom)].filter(Boolean).join(' · ');
+    const fin = R.isPast ? R.realEnd : R.atterAvec, ev = r2(fin - R.depart);
+    return `<button class="cyrow c4 ${isC ? 'cur' : ''}" data-cycm="${esc(c.mois)}"><span class="a"><b>${esc(MONTHS_L[pm(c.mois).m])}${pm(c.mois).y !== pm(S.mois).y ? ' ' + pm(c.mois).y : ''}${isC ? ' <i class="en">EN COURS</i>' : ''}</b><small><span class="mono">${fmtJ(c.debut)}</span> · ${eurM(c.montant).replace(',00', '')}${xtra ? ' <b class="acc2">' + esc(xtra) + '</b>' : ''}${c.man.includes('d') ? ' · date saisie' : ''}${banque ? ' · ' + banque : ''}</small><small>départ : ${esc(k)}</small></span>
+      <span class="mono n">${nbM(R.depart)}</span><span class="mono n t-${tone(acc, fin)}">${nbM(fin)}</span><span class="mono n t-${evTone(ev)}">${sgnN(ev)}</span></button>`;
+  }).join('');
+  return `<section class="view">${backPlus}<h2 class="title">Calendrier salaires</h2>${calTabs(acc)}
+    <p class="hint" style="font-size:13px;margin:-8px 0 0">${P ? 'Un cycle va du jour du salaire à la veille du suivant.' : `Le cycle commence à l'arrivée du ${esc(salLabel(acc).toLowerCase().startsWith('virement') ? salLabel(acc) : 'virement')} ; tant qu'il n'est pas arrivé, la date est estimée au ${defJour(acc)}.`} Touche un cycle pour modifier sa date, son montant ou son solde de départ.</p>
+    <div class="list"><div class="cyrow c4 h"><span>CYCLE · ${P ? 'SALAIRE' : esc(salLabel(acc).toUpperCase())}</span><span>DÉBUT</span><span>FIN</span><span>ÉVOL.</span></div>${rows}</div>
+    <p class="hint" style="font-size:12px;margin:-4px 0 0">Début : solde au départ du cycle. Fin : atterrissage avec budget (réel pour un cycle fini). Évolution : fin − début.</p>
+    <div class="hero" style="gap:10px"><h2>Réglages du cycle</h2>
+      <div class="two"><div class="field"><label for="cfJ">Jour habituel (estimation)</label><input id="cfJ" data-cfj="${esc(acc)}" inputmode="numeric" value="${esc(defJour(acc))}"></div>
+      ${P ? '' : `<div class="field"><label for="cfN">Nom du virement</label><input id="cfN" data-cfn="${esc(acc)}" value="${esc(param('v3nomrev|' + acc, ''))}" placeholder="Ex. Virement du conjoint"></div>`}</div>
+      <div class="hint">Début du suivi : ${fmtJA(S.debut)}. Les opérations d'avant ne sont pas lues.</div></div></section>`;
+}
+
+/* ----- Simulation ----- */
+const SIM = store.get('le31-sim', {});
+const simOf = acc => (SIM[acc] = SIM[acc] || { achats: [{ lib: '', date: '', montant: '' }], credits: [{ lib: '', mens: '', debut: '', fin: '', remplace: '', frais: '' }] });
+const saveSim = () => store.set('le31-sim', SIM);
+function saVerdict(base, a) {
+  const r = simAchat(base, a); if (!r) return '';
+  return r.ok ? `<div class="verdict good"><b>✓ Possible le ${fmtJ(a.date)}</b><div class="two"><span><small>Point le plus bas ensuite</small><b class="mono">${eurM(r.low)}</b></span><span><small>Maximum possible ce jour-là</small><b class="mono">${eurM(r.max)}</b></span></div></div>`
+    : `<div class="verdict warn"><b>▲ Pas possible le ${fmtJ(a.date)}</b><div class="two"><span><small>Date conseillée</small><b class="mono">${r.conseil ? fmtJA(r.conseil) : 'aucune sur 12 cycles'}</b></span><span><small>Maximum possible ce jour-là</small><b class="mono">${eurM(r.max)}</b></span></div></div>`;
+}
+function saTable(base, achats) {
+  const valid = achats.filter(a => simAchat(base, a)), all = simAll(base, valid);
+  return `${valid.length > 1 ? `<div class="note ${all.ok ? 'good' : 'warn'}"><b>Ensemble des achats : ${all.ok ? 'le cumul passe' : 'le cumul ne passe pas'}</b></div>` : ''}
+    <div class="list tbl"><div class="trow h"><span>FIN DE CYCLE AVEC BUDGET</span><span>SANS</span><span>AVEC ${valid.length > 1 ? 'ACHATS' : 'ACHAT'}</span></div>
+    ${base.map((x, k) => `<div class="trow"><span>${esc(MONTHS_L[pm(x.c.mois).m])}</span><span class="mono mini">${eurM(x.end)}</span><span class="mono ${all.ends[k] < 0 ? 'warnt' : ''}">${eurM(all.ends[k])}</span></div>`).join('')}</div>`;
+}
+function scResult(acc, base, cr) {
+  const r = simCredit(acc, base, cr); if (!r || !num(cr.mens)) return '';
+  return `<div class="verdict ${r.ok ? 'good' : 'warn'}"><b>${r.ok ? '✓ Supportable' : '▲ Pas supportable'} sur 12 cycles</b><div class="two"><span><small>Impact net</small><b class="mono">${sgn(r.impact)}</b></span><span><small>Point le plus bas</small><b class="mono">${eurM(r.low)}</b></span></div><div class="two"><span><small>Mensualité max supportable</small><b class="mono">${r.max === null ? '—' : eurM(r.max)}</b></span><span><small>Prélèvements</small><b class="mono">${r.nPay}</b></span></div></div>
+    <div class="list tbl"><div class="trow h"><span>FIN DE CYCLE AVEC BUDGET</span><span>SANS</span><span>AVEC</span></div>${r.rows.map(x => `<div class="trow"><span>${esc(MONTHS_L[pm(x.c.mois).m])}</span><span class="mono mini">${eurM(x.base)}</span><span class="mono ${x.end < 0 ? 'warnt' : ''}">${eurM(x.end)}</span></div>`).join('')}</div>`;
+}
+// Mise à jour des résultats sans redessiner les champs (on peut passer d'un champ à l'autre sans perdre la saisie)
+function simRefresh() {
+  const acc = UI.acc, base = simBase(acc), S = simOf(acc);
+  S.achats.forEach((a, i) => { const e = $('saV' + i); if (e) e.innerHTML = saVerdict(base, a); });
+  const t = $('saT'); if (t) t.innerHTML = saTable(base, S.achats);
+  S.credits.forEach((cr, i) => { const e = $('scV' + i); if (e) e.innerHTML = scResult(acc, base, cr); });
+}
+function vSim() {
+  const acc = UI.acc; if (!started3(acc)) return backPlus + vStart(acc);
+  const base = simBase(acc), S = simOf(acc);
+  const seg = `<div class="seg"><button data-simtab="achat" aria-pressed="${UI.simTab === 'achat'}">Achat</button><button data-simtab="credit" aria-pressed="${UI.simTab === 'credit'}">Crédit</button></div>`;
+  let body;
+  if (UI.simTab === 'achat') {
+    body = S.achats.map((a, i) => `<div class="simcard2"><div class="field"><label for="saL${i}">Achat</label><input id="saL${i}" data-sa="${i}" data-f="lib" value="${esc(a.lib)}" placeholder="Ex. Cadeau de Noël"></div>
+        <div class="two"><div class="field"><label for="saD${i}">Date</label><input type="date" id="saD${i}" data-sa="${i}" data-f="date" value="${esc(a.date)}"></div><div class="field"><label for="saM${i}">Montant (€)</label><input id="saM${i}" data-sa="${i}" data-f="montant" inputmode="decimal" value="${esc(a.montant)}"></div></div>
+        <div id="saV${i}">${saVerdict(base, a)}</div>${S.achats.length > 1 ? `<button class="linkbtn" data-sadel="${i}">Retirer</button>` : ''}</div>`).join('')
+      + `${S.achats.length < 5 ? '<button class="btn dashed" data-saadd="1">+ Tester un autre achat (5 max)</button>' : ''}
+      <div id="saT">${saTable(base, S.achats)}</div>
+      <p class="hint">Rien n'est enregistré. Un achat est possible si, après l'avoir déduit, le solde de fin de cycle avec budgets reste positif à la fin de son cycle et de tous les suivants.</p>`;
+  } else {
+    const recs = DB.recurrents.filter(r => r.compte === acc && r.sens !== '+' && bool(r.actif));
+    body = S.credits.map((cr, i) => `<div class="simcard2"><div class="field"><label for="scL${i}">Crédit</label><input id="scL${i}" data-sc="${i}" data-f="lib" value="${esc(cr.lib)}" placeholder="Ex. Nouvelle voiture"></div>
+        <div class="two"><div class="field"><label for="scM${i}">Mensualité (€)</label><input id="scM${i}" data-sc="${i}" data-f="mens" inputmode="decimal" value="${esc(cr.mens)}"></div><div class="field"><label for="scF${i}">Frais ponctuels (€)</label><input id="scF${i}" data-sc="${i}" data-f="frais" inputmode="decimal" value="${esc(cr.frais)}"></div></div>
+        <div class="two"><div class="field"><label for="scD${i}">1er prélèvement</label><input type="date" id="scD${i}" data-sc="${i}" data-f="debut" value="${esc(cr.debut)}"></div><div class="field"><label for="scE${i}">Dernier prélèvement</label><input type="date" id="scE${i}" data-sc="${i}" data-f="fin" value="${esc(cr.fin)}"></div></div>
+        <div class="field"><label for="scR${i}">Remplace</label><select id="scR${i}" data-sc="${i}" data-f="remplace"><option value="">Rien (crédit en plus)</option>${recs.map(x => `<option value="${esc(x.id)}" ${x.id === cr.remplace ? 'selected' : ''}>${esc(x.libelle)} · ${eurM(num(x.montant))}</option>`).join('')}</select></div>
+        <div id="scV${i}">${scResult(acc, base, cr)}</div>
+        ${S.credits.length > 1 ? `<button class="linkbtn" data-scdel="${i}">Retirer</button>` : ''}</div>`).join('')
+      + `${S.credits.length < 3 ? '<button class="btn dashed" data-scadd="1">+ Tester un autre crédit (3 max)</button>' : ''}
+      <p class="hint">Nouveau crédit : laisse « Remplace » vide. Remplacement : choisis la charge fixe remplacée (ex. Crédit Tesla) ; elle n'est plus prélevée à partir du 1er prélèvement du nouveau crédit. Les frais sont débités à cette date. Chaque crédit est jugé seul.</p>`;
+  }
+  return `<section class="view">${backPlus}<h2 class="title">Simulation</h2>${seg}${body}</section>`;
+}
+
+/* ================= V3.1 : mois par mois (accueil) ================= */
+const iniM = k => MONTHS_L[pm(k).m].charAt(0).toUpperCase();
+const mpmSeg = (attr, cur) => `<div class="seg"><button data-${attr}="g" aria-pressed="${cur !== 'y'}">12 mois glissants</button><button data-${attr}="y" aria-pressed="${cur === 'y'}">Année ${pm(CUR).y}</button></div>`;
+const legend = `<div class="legend"><span><i class="dot"></i>en cours / réel</span><span><i class="dsh"></i>prévu</span></div>`;
+function vMpm(acc) {
+  const cy = cyclesOf(acc), cur = curCycle(acc), y = pm(labelMonth(TODAY_ISO)).y;
+  const L = (UI.mpm === 'y' ? Array.from({ length: 12 }, (_, i) => y + '-' + pad(i + 1)).map(k => ({ k, c: cy.find(c => c.mois === k) || null })) : cy.slice(cur.i, cur.i + 12).map(c => ({ k: c.mois, c })))
+    .map(x => { if (!x.c) return { k: x.k, v: null }; const R = cycleCalc(acc, x.c); return { k: x.k, c: x.c, v: R.isPast ? R.realEnd : R.atterAvec, d: R.depart, st: R.isPast ? 'real' : R.isCur ? 'cur' : 'fut' }; });
+  const ok = L.filter(x => x.v !== null), low = ok.reduce((m, x) => !m || x.v < m.v ? x : m, null), neg = ok.find(x => x.v < 0);
+  const rows = L.map(x => x.v === null ? `<div class="mrow m4 off"><span>${esc(MONTHS_L[pm(x.k).m])}</span><span class="mini" style="grid-column:2/5;text-align:left">avant le suivi</span></div>`
+    : `<button class="mrow m4 ${x.st}" data-gocyc="${esc(x.k)}"><span><b>${esc(MONTHS_L[pm(x.k).m])}</b><small>${x.st === 'real' ? 'réel' : x.st === 'cur' ? 'en cours' : 'prévu'}</small></span><span class="mono">${nbM(x.d)}</span><span class="mono t-${tone(acc, x.v)}">${nbM(x.v)}</span><span class="mono t-${evTone(x.v - x.d)}">${sgnN(r2(x.v - x.d))}</span></button>`).join('');
+  return `<details class="jpj" id="mpm" ${UI.mpmOpen ? 'open' : ''}><summary>Mois par mois<svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M6 9l6 6 6-6"/></svg></summary>
+    <div class="mpmbody">${mpmSeg('mpm', UI.mpm)}
+    <div class="mini">Atterrissage avec budget, fin de chaque cycle${neg ? ` · <b class="t-bad">▼ négatif en ${esc(MONTHS_L[pm(neg.k).m])}</b>` : low ? ` · point le plus bas : <b class="mono">${eurM(low.v)}</b> en ${esc(MONTHS_L[pm(low.k).m])}` : ''}</div>
+    ${lineSvg(L.map(x => ({ lab: iniM(x.k), v: x.v, st: x.st })), 'Atterrissage avec budget, mois par mois')}${legend}
+    <div class="mini">Début : solde au départ du cycle. Fin : atterrissage avec budget (réel pour un cycle fini). Évolution : fin − début.</div>
+    <div class="mrows"><div class="mrow m4 h"><span>MOIS</span><span>DÉBUT</span><span>FIN</span><span>ÉVOLUTION</span></div>${rows}</div><p class="hint">Touche un mois pour ouvrir son cycle.</p></div></details>`;
+}
+
+/* ================= V3.1 : Calendrier > Évolution du salaire ================= */
+const calTabs = acc => isPerso(acc) ? `<div class="ultabs"><button data-caltab="cyc" aria-pressed="${UI.calTab !== 'evo'}">Cycles</button><button data-caltab="evo" aria-pressed="${UI.calTab === 'evo'}">Évolution du salaire</button></div>` : '';
+const monthSel = (id, v, attrs) => `<select id="${id}" ${attrs}>${MONTHS_L.map((m, i) => `<option value="${i + 1}" ${+v === i + 1 ? 'selected' : ''}>${m}</option>`).join('')}</select>`;
+function defaultPlan(acc, excel) {
+  const P = { moisHausse: 6, rattrapDepuis: 1, hausses: {}, primes: [] };
+  // primes habituelles (bonus sur la paie de mars, ½ 13ème mois de juin et de décembre), sans montant : une prime sans montant ne compte pas
+  const pf = excel !== false && excelLikely(acc) && isPerso(acc) ? excelFor(acc).primes || {} : {};
+  P.primes = [
+    { id: uid(), nom: 'Bonus', type: 'paie', mois: 3, jour: '', montants: pf.bonus || {} },
+    { id: uid(), nom: '½ 13ème mois', type: 'part', mois: 6, jour: 15, montants: pf.juin || {} },
+    { id: uid(), nom: '½ 13ème mois', type: 'part', mois: 12, jour: 15, montants: pf.dec || {} }];
+  return P;
+}
+function vEvo(acc) {
+  const P = salPlan(acc), cy = cyclesOf(acc), cur = curCycle(acc), mh = num(P.moisHausse) || 6;
+  const ys = Object.keys(P.hausses || {}).map(Number).sort((a, b) => a - b);
+  const payOf = y => cy.find(c => payMonth(c.mois) === y + '-' + pad(mh));
+  const hRows = ys.map(y => { const c = payOf(y), d = c && c.detail;
+    return `<div class="evrow"><span class="y"><b>${y}</b><small>${d && d.rappel ? `Paie de ${MONTHS_L[mh - 1]} : ${eurM(d.base)} + rattrapage ${eurM(d.rappel)}` : 'hors des 12 prochains mois'}</small></span>
+      <span class="evin"><input id="evh${y}" data-evoh="${y}" inputmode="decimal" value="${esc(fr(P.hausses[y]))}" aria-label="Augmentation ${y} en %"><i>%</i></span>
+      ${d && d.rappel ? `<span class="mono tot">${eurM(d.base + d.rappel)}</span>` : '<span></span>'}<button class="x" data-evohdel="${y}" aria-label="Retirer ${y}">×</button></div>`; }).join('');
+  const nextYear = p => { if (p.type === 'part') { for (let y = pm(CUR).y; y < pm(CUR).y + 3; y++) if (dayOn(y + '-' + pad(+p.mois || 12), +p.jour || 15) >= TODAY_ISO) return y; } const pmNow = payMonth(cur.mois); return +p.mois >= +pmNow.slice(5, 7) && +pmNow.slice(0, 4) === pm(CUR).y ? pm(pmNow).y : pm(pmNow).y + (+p.mois < +pmNow.slice(5, 7) ? 1 : 0); };
+  const pRows = (P.primes || []).map(p => { const y = nextYear(p), m = (p.montants || {})[y];
+    return `<div class="evp"><div class="two"><div class="field"><label for="epn${p.id}">Prime</label><input id="epn${p.id}" data-evp="${esc(p.id)}" data-f="nom" value="${esc(p.nom)}"></div>
+      <div class="field"><label for="ept${p.id}">Versée</label><select id="ept${p.id}" data-evp="${esc(p.id)}" data-f="type"><option value="paie" ${p.type !== 'part' ? 'selected' : ''}>dans la paie</option><option value="part" ${p.type === 'part' ? 'selected' : ''}>virement à part</option></select></div></div>
+      <div class="two"><div class="field"><label for="epm${p.id}">${p.type === 'part' ? 'Mois' : 'Sur la paie de'}</label>${monthSel('epm' + p.id, p.mois, `data-evp="${esc(p.id)}" data-f="mois"`)}</div>
+      ${p.type === 'part' ? `<div class="field"><label for="epj${p.id}">Jour</label><input id="epj${p.id}" data-evp="${esc(p.id)}" data-f="jour" inputmode="numeric" value="${esc(p.jour || 15)}"></div>` : '<span></span>'}</div>
+      <div class="evrow" style="border:0;padding:4px 0 0"><span class="y"><b>${y}</b><small>${m === undefined || m === '' ? (primeAmt(p, y) ? 'repris : ' + eurM(primeAmt(p, y)) : 'montant à saisir') : 'saisi'}</small></span>
+      <span class="evin"><input id="epv${p.id}" data-evpm="${esc(p.id)}" data-y="${y}" inputmode="decimal" value="${m !== undefined && m !== '' ? esc(fr(m)) : ''}" placeholder="${primeAmt(p, y) ? esc(fr(primeAmt(p, y))) : 'à saisir'}" aria-label="Montant ${esc(p.nom)} ${y}"><i>€</i></span><span></span>
+      <button class="x" data-evpdel="${esc(p.id)}" aria-label="Retirer la prime">×</button></div></div>`; }).join('');
+  // ce que Le 31 attend à la banque (12 prochains mois)
+  const exp = []; cy.slice(cur.i + 1, cur.i + 13).forEach(c => { const d = c.detail; if (d.rappel || d.primes.length) exp.push({ date: c.debut, lab: `paie de ${MONTHS_L[pm(payMonth(c.mois)).m]}${d.rappel ? ' + augmentation' : ''}${d.primes.length ? ' + ' + d.primes.map(p => p.nom.toLowerCase()).join(', ') : ''}`, det: `${eurM(d.base)}${d.rappel ? ' + rattrapage ' + eurM(d.rappel) : ''}${d.primes.map(p => ' + ' + eurM(p.v)).join('')}`, v: c.montant, est: !c.row.debut }); });
+  primeParts(acc, TODAY_ISO, addD(TODAY_ISO, 366)).forEach(p => exp.push({ date: p.date, lab: p.nom, det: 'virement à part', v: p.v }));
+  (P.primes || []).filter(p => p.type === 'part').forEach(p => { const y = nextYear(p), d = dayOn(y + '-' + pad(+p.mois || 12), +p.jour || 15); if (!primeAmt(p, y) && d <= addD(TODAY_ISO, 366)) exp.push({ date: d, lab: p.nom, det: 'montant à saisir', v: null }); });
+  exp.sort((a, b) => a.date.localeCompare(b.date));
+  return `<section class="view">${backPlus}<h2 class="title">Calendrier salaires</h2>${calTabs(acc)}
+    <div class="hero" style="gap:10px"><div class="rowhead"><h2>Augmentation annuelle</h2><span class="mini" style="text-align:right">salaire actuel<br><b class="mono" style="white-space:nowrap">${eurM(cur.base)}</b></span></div>
+      <div class="two"><div class="field"><label for="evMh">Sur la paie de</label>${monthSel('evMh', mh, 'data-evo="moisHausse"')}</div><div class="field"><label for="evRd">Rattrapage depuis</label>${monthSel('evRd', P.rattrapDepuis || 1, 'data-evo="rattrapDepuis"')}</div></div>
+      <div class="evlist">${hRows || '<div class="mini">Aucune augmentation prévue.</div>'}</div>
+      <button class="btn dashed" data-evohadd="1">+ Ajouter une année</button>
+      <div class="hint">L'augmentation et le rattrapage arrivent dans le virement de la paie de ${MONTHS_L[mh - 1]} (cycle de ${MONTHS_L[mh % 12]}). Les années suivantes reprennent le dernier pourcentage. Corrige-le quand tu connais le vrai chiffre.</div></div>
+    <div class="hero" style="gap:10px"><div class="rowhead"><h2>Primes</h2></div>${pRows || '<div class="mini">Aucune prime.</div>'}
+      <button class="btn dashed" data-evpadd="1">+ Ajouter une prime</button>
+      <div class="hint">Chaque année reprend le montant de l'année d'avant tant que tu ne le changes pas. Une prime sans montant n'est pas comptée.</div></div>
+    <div class="hero" style="gap:6px"><div class="rowhead"><h2>Ce que Le 31 attend à la banque</h2></div>
+      <div class="list">${exp.length ? exp.map(e => `<div class="item" style="grid-template-columns:1fr auto"><span class="lbl"><b style="white-space:normal">${fmtJA(e.date)} · ${esc(e.lab)}</b><small>${esc(e.det)}</small></span><span class="amt ${e.v ? 'pos' : ''}">${e.v ? sgn(e.v) : '—'}</span></div>`).join('') : '<div class="empty">Rien de particulier sur les 12 prochains mois : paie habituelle de ' + eurM(cur.base) + '.</div>'}</div>
+      <div class="hint">Ces montants comptent dans l'atterrissage, les cycles suivants et la simulation. Quand la banque les voit, elle les reconnaît seule (montant attendu à ± 10 %).</div></div></section>`;
+}
+function saveEvo(acc, f) { const P = JSON.parse(JSON.stringify(salPlan(acc))); f(P); stage([regOp(acc, 'salaire', P)]); flush(); renderKeep(); }
+function renderKeep() { setTimeout(() => { const a = document.activeElement, id = a && a.id; render(); const e = id && $(id); if (e) { try { e.focus(); } catch (x) {} } }, 0); }
+
+/* ================= V3.1 : Épargne ================= */
+const lastDayPrev = () => addD(CUR + '-01', -1);
+const livName = L => esc(L.nom);
+function vEpaStart(acc) {
+  const X = excelFor(acc), ex = excelLikely(acc) && !!X.epargne, rows = (ex ? X.epargne : EPA_DEF[isPerso(acc) ? 'perso' : 'commun']).map(([n, t, pz, ob]) => ({ n, t, pz: ex ? pz : '', ob: ex ? ob : '' })).concat([{ n: '', t: 'livret', pz: '', ob: '' }]);
+  return `<section class="view">${backPlus}<h2 class="title">Démarrer l'épargne · ${esc(shortAcc(acc))}</h2>
+    <p class="hint" style="font-size:13px;margin:-8px 0 0">Point zéro : le solde de chaque livret à la date ci-dessous au soir. Ensuite, tout se calcule avec tes virements. Les mois vont du 1er au dernier jour.</p>
+    <form class="form" id="epaStart" data-acc="${esc(acc)}" novalidate>
+      <div class="field"><label for="ezD">Date du point zéro</label><input type="date" id="ezD" value="${lastDayPrev()}"></div>
+      <div class="list">${rows.map((r, i) => `<div class="env" style="gap:8px"><div class="two"><div class="field"><label for="ezN${i}">Livret</label><input id="ezN${i}" value="${esc(r.n)}" data-t="${r.t}"></div><div class="field"><label for="ezT${i}">Type</label><select id="ezT${i}"><option value="livret" ${r.t !== 'invest' ? 'selected' : ''}>Livret</option><option value="invest" ${r.t === 'invest' ? 'selected' : ''}>Investissement</option></select></div></div>
+        <div class="two"><div class="field"><label for="ezS${i}">${r.t === 'invest' ? 'Déjà versé' : 'Solde'} au point zéro (€)</label><input id="ezS${i}" inputmode="decimal" value="${esc(r.pz === '' ? '' : fr(r.pz))}" placeholder="0,00"></div><div class="field"><label for="ezO${i}">Objectif / mois (€)</label><input id="ezO${i}" inputmode="decimal" value="${esc(r.ob === '' ? '' : fr(r.ob))}" placeholder="—"></div></div></div>`).join('')}</div>
+      ${ex ? '<div class="note">Montants pré-remplis : vérifie-les avant de démarrer.</div>' : '<div class="note">Efface le nom d\'un livret que tu n\'as pas ; la ligne vide sert à en ajouter un.</div>'}
+      <div class="hint">Investissement : on suit ce que tu verses, pas la valeur du placement. Les charges fixes et prévues dont le nom contient celui d'un livret (ex. « Économie → Livret A ») y sont rattachées tout de suite.</div>
+      <button class="btn" type="submit">Démarrer</button></form></section>`;
+}
+function startEpaOps(acc) {
+  const d = $('ezD').value, ops = [], made = [];
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) { toast('Indique la date du point zéro'); return null; }
+  for (let i = 0; $('ezN' + i); i++) {
+    const n = $('ezN' + i).value.trim(); if (!n) continue;
+    const L = { id: uid(), compte: acc, nom: n, type: $('ezT' + i).value, pointZero: r2(num($('ezS' + i).value) || 0), dateZero: d, objectif: num($('ezO' + i).value) === null ? '' : r2(num($('ezO' + i).value)), ordre: i + 1, actif: 'oui' };
+    ops.push(upd('Livrets', L)); made.push(L);
+  }
+  if (!made.length) { toast('Indique au moins un livret'); return null; }
+  ops.push(...linkOps(acc, made));
+  return ops;
+}
+// rattache les fixes et prévues dont le nom (ou la catégorie) désigne un livret
+function linkOps(acc, Ls) {
+  const ops = [], hit = (txt, L) => NORM(txt).includes(NORM(L.nom));
+  const find = (lib, cat) => Ls.find(L => hit(lib, L)) || Ls.find(L => cat && NORM(cat) === NORM(L.nom)) || Ls.find(L => L.type === 'invest' && /INVEST|TRADE|BOURSE|PEA|CTO/.test(NORM(lib + ' ' + (cat || ''))));
+  DB.recurrents.filter(r => r.compte === acc && !r.livret && r.sens !== '+').forEach(r => { const L = find(r.libelle, r.categorie); if (L) ops.push(upd('Recurrents', { id: r.id, livret: L.id })); });
+  DB.prevues.filter(p => p.compte === acc && !p.livret && !p.etat && (num(p.montant) || 0) < 0).forEach(p => { const L = find(p.libelle, p.categorie); if (L) ops.push(upd('Prevues', { id: p.id, livret: L.id })); });
+  return ops;
+}
+function vEpa() {
+  const acc = UI.acc; if (!started3(acc)) return backPlus + vStart(acc);
+  const Ls = livretsOf(acc); if (!Ls.length) return vEpaStart(acc);
+  const first = addM(Ls.map(L => L.dateZero).sort()[0].slice(0, 7), 1), k = UI.epM && UI.epM >= first ? UI.epM : (CUR >= first ? CUR : first);
+  const last = addM(CUR, 12), data = Ls.map(L => ({ L, m: livMonths(L, last).find(x => x.k === k) }));
+  const sumNet = r2(data.reduce((a, x) => a + (x.m ? (x.m.st === 'fut' ? x.m.realNet + x.m.projNet : x.m.realNet) : 0), 0)), sumObj = r2(Ls.reduce((a, L) => a + (num(L.objectif) || 0), 0));
+  const cards = data.map(({ L, m }) => {
+    const solde = k === CUR ? livSolde(L, TODAY_ISO) : m ? m.fin : num(L.pointZero) || 0, o = num(L.objectif) || 0, st = livObj(L, m);
+    const done = m ? (m.st === 'fut' ? m.realNet + m.projNet : m.realNet) : 0, pc = o ? Math.max(0, Math.min(100, Math.round(100 * done / o))) : 0;
+    return `<button class="env2" data-livid="${esc(L.id)}"><span class="t"><b>${livName(L)}${L.type === 'invest' ? '<small class="mini" style="display:block;font-weight:400">total versé</small>' : ''}</b><span class="mono" style="font-size:16px;color:var(--ink)">${eurM(solde)}</span></span>
+      ${o ? `<span class="bar"><i class="${st === 'late' ? 'over' : ''}" style="width:${pc}%"></i></span>` : ''}
+      <span class="t"><span class="mono mini">${sgn(done)}${o ? ' / ' + eurM(o) : ''} ce mois</span>${st === 'ok' ? '<span class="ok mini">✓ atteint</span>' : st === 'wait' ? '<span class="mini">à venir</span>' : st === 'late' ? '<span class="warnt mini">▼ en retard</span>' : ''}</span></button>`;
+  }).join('');
+  return `<section class="view">${backPlus}<h2 class="title">Épargne</h2>
+    <div class="cycnav"><button class="nb" data-epm="-1" ${k > first ? '' : 'disabled'} aria-label="Mois précédent">‹</button><div class="cyct"><b>${esc(MONTHS_L[pm(k).m].replace(/^./, x => x.toUpperCase()))} ${pm(k).y}</b><span class="mono">${fmtJ(k + '-01')} → ${fmtJ(monthEnd(k))}</span></div><button class="nb" data-epm="1" ${k < addM(CUR, 11) ? '' : 'disabled'} aria-label="Mois suivant">›</button></div>
+    <div class="bigsolde" style="flex-direction:row;justify-content:space-between;align-items:flex-end"><span style="display:flex;flex-direction:column;gap:2px"><small>${k > CUR ? 'Prévu ce mois' : 'Épargné ce mois'}</small><b class="mono" style="font-size:32px">${sgn(sumNet)}</b></span>${sumObj ? `<span class="mono mini" style="text-align:right">objectif<br>${eurM(sumObj)}</span>` : ''}</div>
+    <div class="list">${cards}</div>
+    <button class="btn dashed" data-newliv="1">+ Ajouter un livret</button>
+    ${vEpaMpm(acc, Ls)}
+    <p class="hint">Un livret se remplit avec les virements classés « Épargne » dans À classer et avec les charges fixes liées à un livret. Une rentrée depuis un livret est un retrait.</p></section>`;
+}
+function vEpaMpm(acc, Ls) {
+  const sel = UI.epS !== 'tot' && Ls.find(L => L.id === UI.epS) ? [Ls.find(L => L.id === UI.epS)] : Ls, y = pm(CUR).y;
+  const ks = UI.epMpm === 'y' ? Array.from({ length: 12 }, (_, i) => y + '-' + pad(i + 1)) : Array.from({ length: 12 }, (_, i) => addM(CUR, i));
+  const last = ks[ks.length - 1] > addM(CUR, 12) ? ks[ks.length - 1] : addM(CUR, 12);
+  const rows = ks.map(k => { const ms = sel.map(L => livMonths(L, last).find(x => x.k === k)); if (ms.every(m => !m)) return { k, v: null };
+    return { k, v: r2(ms.reduce((a, m) => a + (m ? m.fin : 0), 0)), net: r2(ms.reduce((a, m) => a + (m ? m.net + m.int : 0), 0)), st: k < CUR ? 'real' : k === CUR ? 'cur' : 'fut' }; });
+  const pz = r2(sel.reduce((a, L) => a + (num(L.pointZero) || 0), 0));
+  return `<details class="jpj" id="epmpm" ${UI.epMpmOpen ? 'open' : ''}><summary>Mois par mois<svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M6 9l6 6 6-6"/></svg></summary>
+    <div class="mpmbody">${mpmSeg('epmpm', UI.epMpm)}
+    ${Ls.length > 1 ? `<div class="chips">${[['tot', 'Total']].concat(Ls.map(L => [L.id, L.nom])).map(([id, n]) => `<button class="chip" data-eps="${esc(id)}" aria-pressed="${(UI.epS === id) || (id === 'tot' && sel === Ls)}">${esc(n)}</button>`).join('')}</div>` : ''}
+    <div class="mini">${sel.length > 1 ? 'Épargne totale' : esc(sel[0].nom)} en fin de mois · point zéro <b class="mono">${eurM(pz)}</b> au ${fmtJ(sel[0].dateZero)}</div>
+    ${lineSvg(rows.map(x => ({ lab: iniM(x.k), v: x.v, st: x.st })), 'Épargne, mois par mois')}${legend}
+    <div class="mini">Début et fin : solde en début et en fin de mois. Évolution : versé − retiré + intérêts.</div>
+    <div class="mrows"><div class="mrow m4 h"><span>MOIS</span><span>DÉBUT</span><span>FIN</span><span>ÉVOLUTION</span></div>${rows.map(x => x.v === null ? `<div class="mrow m4 off"><span>${esc(MONTHS_L[pm(x.k).m])}</span><span class="mini" style="grid-column:2/5;text-align:left">avant le point zéro</span></div>`
+      : `<button class="mrow m4 ${x.st}" data-epgo="${esc(x.k)}"><span><b>${esc(MONTHS_L[pm(x.k).m])}</b><small>${x.st === 'real' ? 'réel' : x.st === 'cur' ? 'en cours' : 'prévu'}</small></span><span class="mono">${nbM(r2(x.v - x.net))}</span><span class="mono b">${nbM(x.v)}</span><span class="mono t-${evTone(x.net)}">${sgnN(x.net)}</span></button>`).join('')}</div>
+    <p class="hint">Les mois prévus viennent des charges fixes et des prévues liées aux livrets.</p></div></details>`;
+}
+function vEpl() {
+  const L = livOf(UI.epL); if (!L) { UI.tab = 'epa'; return vEpa(); }
+  const first = addM(L.dateZero.slice(0, 7), 1), ms = livMonths(L, addM(CUR, 12)), k = UI.epM && UI.epM >= first ? UI.epM : (CUR >= first ? CUR : first);
+  const m = ms.find(x => x.k === k), show = UI.eplAll ? ms : ms.filter(x => x.k >= (CUR >= first ? CUR : first)).slice(0, 5);
+  const inv = L.type === 'invest';
+  return `<section class="view"><button class="back" data-tab="epa">‹ Épargne</button>
+    <div class="rowhead"><h2 class="title">${livName(L)}</h2><span class="mini">${esc(shortAcc(L.compte))}</span></div>
+    <div class="tiles3"><div><small>${inv ? 'Total versé' : 'Solde actuel'}</small><b class="mono">${eurM(livSolde(L, TODAY_ISO))}</b></div><div><small>Point zéro ${fmtJ(L.dateZero)}</small><b class="mono">${eurM(num(L.pointZero) || 0)}</b></div><div><small>Objectif / mois</small><b class="mono acc">${num(L.objectif) ? eurM(num(L.objectif)) : '—'}</b></div></div>
+    <div class="list tbl"><div class="trow5 h"><span>MOIS</span><span>VERSÉ</span><span>RETIRÉ</span><span>${inv ? '' : 'INTÉR.'}</span><span>FIN (€)</span></div>
+      ${show.map(x => `<button class="trow5 ${x.st}" data-epgo="${esc(x.k)}"><span>${esc(MONTHS_C[pm(x.k).m])}${x.k.slice(0, 4) !== String(pm(CUR).y) ? ' ' + x.k.slice(2, 4) : ''}<small>${x.st === 'real' ? 'réel' : x.st === 'cur' ? 'en cours' : 'prévu'}</small></span><span class="mono">${x.vers ? nbM(x.vers) : '—'}</span><span class="mono">${x.retr ? nbM(x.retr) : '—'}</span><span class="mono">${inv ? '' : x.int ? nbM(x.int) : '—'}</span><span class="mono b">${nbM(x.fin)}</span></button>`).join('')}
+      <button class="linkbtn" style="padding-left:14px" data-eplall="1">${UI.eplAll ? 'Moins' : 'Voir tous les mois'}</button></div>
+    <div class="hero" style="gap:6px"><div class="rowhead"><h2>Mouvements · ${esc(MONTHS_L[pm(k).m])} ${pm(k).y}</h2></div>
+      <div class="list">${m && (m.real.length || m.proj.length) ? m.real.concat(m.proj).sort((a, b) => a.date.localeCompare(b.date)).map(f => `<${f.mid ? `button data-mvlid="${esc(f.mid)}"` : f.oid ? `button data-oid="${esc(f.oid)}"` : 'div'} class="item ${f.prevu ? 'off' : ''}" style="grid-template-columns:52px 1fr auto"><span class="day">${fmtJ(f.date)}</span><span class="lbl"><b>${esc(f.label)}</b><small>${f.prevu ? 'prévu' : f.kind === 'int' ? 'intérêts' : f.mid ? 'à la main' : 'vu à la banque'}</small></span><span class="amt ${f.v > 0 ? 'pos' : ''}">${sgn(f.v)}</span></${f.mid || f.oid ? 'button' : 'div'}>`).join('') : '<div class="empty">Aucun mouvement ce mois-ci.</div>'}</div></div>
+    ${inv ? '' : `<form class="hero" id="recalForm" data-l="${esc(L.id)}" style="gap:8px" novalidate><div class="rowhead"><h2>Recaler le solde</h2></div>
+      <div class="hint">Tape le solde réel du livret (relevé, appli de la banque) : l'écart est enregistré en intérêts, aujourd'hui.</div>
+      <div class="rcrow"><input id="rcV" inputmode="decimal" placeholder="${esc(fr(livSolde(L, TODAY_ISO)))}" aria-label="Solde réel"><button class="btn dark" type="submit">Recaler</button></div></form>`}
+    <div class="two"><button class="btn ghost" data-livedit="${esc(L.id)}">Modifier</button><button class="btn ghost" data-mvlnew="${esc(L.id)}">Mouvement à la main</button></div></section>`;
+}
+function livSheet(acc, L) {
+  openSheet(`<form class="form" id="livForm" data-acc="${esc(acc)}" data-id="${esc(L ? L.id : '')}" novalidate><h2>${L ? livName(L) : 'Nouveau livret'}</h2>
+    <div class="two"><div class="field"><label for="lvN">Nom</label><input id="lvN" value="${esc(L ? L.nom : '')}" placeholder="Ex. PEL"></div><div class="field"><label for="lvT">Type</label><select id="lvT"><option value="livret">Livret</option><option value="invest" ${L && L.type === 'invest' ? 'selected' : ''}>Investissement</option></select></div></div>
+    <div class="two"><div class="field"><label for="lvZ">Point zéro (€)</label><input id="lvZ" inputmode="decimal" value="${L ? esc(fr(L.pointZero)) : ''}"></div><div class="field"><label for="lvD">Au</label><input type="date" id="lvD" value="${esc(L ? L.dateZero : lastDayPrev())}"></div></div>
+    <div class="field"><label for="lvO">Objectif / mois (€)</label><input id="lvO" inputmode="decimal" value="${L && L.objectif !== '' ? esc(fr(L.objectif)) : ''}" placeholder="—"></div>
+    <div class="actions">${L ? `<button type="button" class="btn danger" data-livdel="${esc(L.id)}">Supprimer</button>` : ''}<button class="btn" type="submit">Enregistrer</button></div><div id="confirmBox"></div></form>`);
+}
+function mvlSheet(L, mv) {
+  const v = mv ? num(mv.montant) || 0 : 0, t = mv ? (mv.type === 'interets' ? 'int' : v < 0 ? 'retr' : 'vers') : 'vers';
+  openSheet(`<form class="form" id="mvlForm" data-l="${esc(L.id)}" data-id="${esc(mv ? mv.id : '')}" novalidate><h2>${livName(L)} · mouvement</h2>
+    <div class="seg seg3" id="mvlT"><button type="button" data-mvlt="vers" aria-pressed="${t === 'vers'}">Versement</button><button type="button" data-mvlt="retr" aria-pressed="${t === 'retr'}">Retrait</button><button type="button" data-mvlt="int" aria-pressed="${t === 'int'}">Intérêts</button></div>
+    <div class="two"><div class="field"><label for="mvA">Montant (€)</label><input id="mvA" inputmode="decimal" value="${mv ? esc(fr(Math.abs(v))) : ''}"></div><div class="field"><label for="mvD">Date</label><input type="date" id="mvD" value="${esc(mv ? mv.date : TODAY_ISO)}"></div></div>
+    <div class="field"><label for="mvL">Libellé</label><input id="mvL" value="${esc(mv ? mv.libelle : '')}" placeholder="Ex. virement depuis une autre banque"></div>
+    <div class="hint">Seulement pour ce qui ne passe pas par ton compte suivi (sinon, classe l'opération « Épargne » dans À classer).</div>
+    <div class="actions">${mv ? `<button type="button" class="btn danger" data-mvldel="${esc(mv.id)}">Supprimer</button>` : ''}<button class="btn" type="submit">Enregistrer</button></div></form>`);
+}
+const livSelect = (acc, sel, id) => livretsOf(acc).length ? `<div class="field"><label for="${id}">Va vers le livret</label><select id="${id}"><option value="">—</option>${livretsOf(acc).map(L => `<option value="${esc(L.id)}" ${L.id === sel ? 'selected' : ''}>${livName(L)}</option>`).join('')}</select></div>` : '';
+
+/* ----- migration V3.0 → V3.1 (une fois, sur l'appareil du propriétaire) ----- */
+let MIG31 = false;
+function migrate31() {
+  if (MIG31 || !LOADED || !ME) return;
+  MIG31 = true;
+  const ops = [];
+  accs().filter(a => a.proprietaire === ME).forEach(a => {
+    const pv = DB.parametres.find(p => p.cle === 'v3|' + a.id);
+    if (pv && !DB.reglages.some(r => r.id === a.id + '|v3')) ops.push(upd('Reglages', { id: a.id + '|v3', compte: a.id, cle: 'v3', valeur: pv.valeur }), del('Parametres', 'v3|' + a.id));
+    if (started3(a.id) && !DB.reglages.some(r => r.id === a.id + '|salaire')) {
+      // la prévue « ½ 13ème mois » de la V3.0 devient la prime du même mois (son montant est repris)
+      const P = defaultPlan(a.id), parts = P.primes.filter(p => p.type === 'part');
+      DB.prevues.filter(p => p.compte === a.id && !p.etat && /13/.test(p.libelle)).forEach(p => {
+        const pr = parts.find(x => +x.mois === +p.date.slice(5, 7)), v = Math.abs(num(p.montant) || 0);
+        if (!pr) return;
+        if (v && !pr.montants[p.date.slice(0, 4)]) pr.montants[p.date.slice(0, 4)] = r2(v);
+        ops.push(del('Prevues', p.id));
+      });
+      ops.push(regOp(a.id, 'salaire', P));
+    }
+  });
+  if (ops.length) commit(ops);
+}
+
+/* ----- Réglages ----- */
+function vSet() {
+  const sysDark = matchMedia('(prefers-color-scheme: dark)').matches, dark = UI.theme === 'dark' || (UI.theme === 'auto' && sysDark);
+  const syncTxt = { ok: 'Synchronisé', wait: 'Envoi en cours…', off: 'Hors ligne', err: 'Accès coupé' }[SYNC.state] || '';
+  const accBlock = A => `<div class="env" style="gap:8px"><div class="field"><label for="an-${esc(A.id)}">Nom du compte</label><input id="an-${esc(A.id)}" data-accname="${esc(A.id)}" value="${esc(A.nom)}"></div>
+    <div class="mini">${A.proprietaire ? 'Compte privé' : DB.profils.length > 1 ? 'Compte partagé' : ''}${started3(A.id) ? ` · suivi depuis le ${fmtJA(v3(A.id).debut)}` : ' · suivi pas encore démarré'}</div>
+    ${started3(A.id) ? colBlock(A.id) : ''}
+    ${started3(A.id) ? `<div class="actions" id="rs-${esc(A.id)}"><button class="btn danger small" data-reset="${esc(A.id)}">Recommencer le suivi de ce compte</button></div>` : ''}</div>`;
+  return `<section class="view">${backPlus}<h2 class="title">Réglages</h2>
+    ${vBankSet()}
+    <div class="hero" style="gap:10px"><div class="rowhead"><h2>Comptes</h2></div><div class="list">${accs().map(accBlock).join('')}</div>
+      <div class="hint">« Recommencer » efface les opérations, fixes, cycles, prévues et règles apprises de ce compte dans Le 31 (pas à la banque), pour redémarrer à une autre date. Les budgets sont gardés.</div></div>
+    ${vProfiles()}
+    <div class="hero" style="gap:6px"><div class="rowhead"><h2>Apparence</h2></div>
+      <label class="switch" for="th-auto"><span>Suivre le réglage du téléphone</span><input type="checkbox" id="th-auto" data-theme-auto="1" ${UI.theme === 'auto' ? 'checked' : ''}></label>
+      <label class="switch" for="th-dark" style="${UI.theme === 'auto' ? 'opacity:.45' : ''}"><span>Mode sombre</span><input type="checkbox" id="th-dark" data-theme-dark="1" ${dark ? 'checked' : ''} ${UI.theme === 'auto' ? 'disabled' : ''}></label></div>
+    <div class="hero" style="gap:8px"><div class="rowhead"><h2>Synchronisation</h2><span class="pill ${SYNC.state === 'ok' ? 'good' : SYNC.state === 'err' ? 'bad' : 'warn'}">${syncTxt}</span></div>
+      <div class="hint">Les saisies partent tout de suite vers le Google Sheet ; sans réseau, elles sont gardées et envoyées au retour de la connexion.${QUEUE.length ? ` <b>${QUEUE.length} modification(s) en attente.</b>` : ''} Dernière synchro : ${SYNC.last ? new Date(SYNC.last).toLocaleString('fr-FR', { dateStyle: 'short', timeStyle: 'short' }) : 'jamais'}.</div>
+      <button class="btn ghost small" data-syncnow="1">Synchroniser maintenant</button></div>
+  </section>`;
+}
+function colBlock(id) {
+  const S = colSet(id), sv = nbM(S.seuil).replace(',00', '');
+  return `<div class="colset"><b>Couleurs de l'accueil</b>
+    <div class="two"><div class="field"><label for="cs-${esc(id)}">Seuil du vert (€)</label><input id="cs-${esc(id)}" inputmode="decimal" data-colseuil="${esc(id)}" value="${esc(String(S.seuil).replace('.', ','))}"></div>
+    <div class="field"><label for="cm-${esc(id)}">Marge du rythme (points)</label><input id="cm-${esc(id)}" inputmode="numeric" data-colmarge="${esc(id)}" value="${esc(String(S.marge))}"></div></div>
+    <div class="chips3"><span class="mini">Atterrissage :</span><span class="pill bad">sous 0</span><span class="pill warn">0 à ${sv}</span><span class="pill good">${sv} et plus</span></div>
+    <div class="hint">Budgets : orange si tu dépenses plus de ${esc(String(S.marge))} points plus vite que le cycle avance, rouge si le budget est dépassé.</div></div>`;
+}
+function resetOps3(acc) {
+  const ops = [];
+  ['mouvements', 'recurrents', 'cycles', 'prevues', 'apprentissage'].forEach(k => DB[k].filter(r => r.compte === acc).forEach(r => ops.push(del(TABS[k], r.id))));
+  ops.push(del('Parametres', 'v3|' + acc));
+  if (DB.reglages.some(r => r.id === acc + '|v3')) ops.push(del('Reglages', acc + '|v3'));
+  return ops;
+}
+
+/* ================= Feuilles ================= */
+const catSelect = (acc, sel, id) => `<select id="${id}"><option value="">—</option>${catNames(acc).map(n => `<option ${n === sel ? 'selected' : ''}>${esc(n)}</option>`).join('')}${sel && !catNames(acc).includes(sel) ? `<option selected>${esc(sel)}</option>` : ''}<option value="__new">+ Nouvelle catégorie…</option></select><input id="${id}New" placeholder="Nouvelle catégorie" hidden>`;
+const readCat = id => { const v = $(id).value; return v === '__new' ? ($(id + 'New').value || '').trim() : v; };
+// Une opération (correction du classement, saisie à la main)
 function opSheet(o) {
-  const acc = o.compte, isVir = o.type === 'vir', isAdj = o.type === 'ajust', amt = num(o.montant) || 0, imp = !!o.ref, sim = simOps(o);
-  const cats = catsOf(acc).map(c => c.nom); if (o.categorie && !cats.includes(o.categorie) && !isVir && !isAdj) cats.push(o.categorie);
-  const kind = o.type === 'exc' || o.type === 'int' ? o.type : 'ponct';
+  const acc = o.compte, v = num(o.montant) || 0, man = !o.ref && o.type !== 'ajust';
+  const kinds = [['ponct', 'Ponctuel'], ['fixe', 'Fixe']].concat(v > 0 ? [['sal', isPerso(acc) ? 'Salaire' : 'Début de cycle']] : []).concat(livretsOf(acc).length ? [['epargne', 'Épargne']] : []).concat([['', 'À classer']]);
+  const recs = DB.recurrents.filter(r => r.compte === acc && (r.sens === '+') === (v > 0));
+  const k = o.type === 'ajust' ? 'ajust' : (o.type || '');
   openSheet(`<form class="form" id="opForm" data-id="${esc(o.id)}" novalidate>
-    <h2>${isAdj ? 'Correction de solde' : isVir ? 'Virement entre comptes' : amt < 0 ? 'Dépense' : 'Rentrée'}</h2>
-    <div class="mini" style="font-size:13px">${esc(accName(acc))}${o.profil ? ' · ' + (imp ? 'importé par ' : 'saisi par ') + esc(pname(o.profil)) : ''}</div>
-    ${imp ? `<div class="raw">Relevé : ${esc(o.libelle)}</div>` : ''}
-    <div class="amountbox"><input id="oA" inputmode="decimal" value="${fr(r2(Math.abs(amt)))}" aria-label="Montant"><span>€</span></div>
-    ${isAdj ? `<div class="note">${amt >= 0 ? 'Ajout' : 'Retrait'} de ${eur(Math.abs(amt))} pour recaler le solde sur la banque.</div>` : ''}
-    <div class="field"><label for="oL">${imp ? 'Nom' + (sim.length ? ` (pour les ${sim.length + 1} opérations de ce marchand)` : '') : 'Libellé'}</label><input id="oL" value="${esc(nameOf(o))}" autocomplete="off"></div>
-    ${!isVir && !isAdj ? `<div class="field"><label for="oC">Catégorie</label><select id="oC" data-ocat="1"><option value="" ${o.categorie ? '' : 'selected'}>À classer</option>${cats.map(c => `<option ${c === o.categorie ? 'selected' : ''}>${esc(c)}</option>`).join('')}<option value="__new">＋ Nouvelle catégorie…</option></select>
-      <input id="oCnew" placeholder="Ex. Véhicule > Garage (sous-catégorie) ou Animaux" autocomplete="off" hidden style="margin-top:6px"></div>
-      ${sim.length ? `<label class="switch" for="oSim" style="gap:10px"><span style="font-size:14px">Appliquer la catégorie aux <b>${sim.length}</b> autre${sim.length > 1 ? 's' : ''} opération${sim.length > 1 ? 's' : ''} de ce marchand, et aux prochains imports</span><input type="checkbox" id="oSim" checked></label>` : ''}
-      ${imp ? `<button type="button" class="btn ghost small" data-seuil2="${esc(o.id)}" style="margin-top:2px">${seuilRule(acc, o.libelle) ? 'Modifier la séparation par montant' : 'Ce marchand a deux usages différents (ex. courses et carburant) : séparer par le montant'}</button>` : ''}
-      <div class="field"><label>Compter comme</label><div class="seg" style="grid-template-columns:1fr 1fr 1fr" role="group" aria-label="Type">${[['ponct', 'Normal'], ['exc', 'Exceptionnel'], ['int', 'Entre mes comptes']].map(([k, l]) => `<button type="button" data-okind="${k}" aria-pressed="${kind === k}">${l}</button>`).join('')}</div>
-      <div class="hint" id="kindHint">${kind === 'exc' ? 'Compté dans le solde, pas dans les habitudes ni les prévisions.' : kind === 'int' ? 'Épargne, livret, autre compte à toi : ni dépense ni revenu.' : 'Dépense ou rentrée courante : entre dans les habitudes.'}</div></div>` : ''}
-    <div class="field"><label for="oD">Date</label><input id="oD" type="date" value="${esc(o.date)}"></div>
-    ${!isVir && !isAdj ? `<button type="button" class="btn ghost" data-tofix="${esc(o.id)}">↻ C'est une charge ${amt > 0 ? 'ou une rentrée ' : ''}régulière : passer en fixe</button>` : ''}
-    <div class="actions"><button type="button" class="btn danger" data-odel="${esc(o.id)}">Supprimer</button><button class="btn" type="submit">Enregistrer</button></div>
+    <div class="rowhead"><h2>${esc(nameOf(o))}</h2><span class="mono">${sgn(v)}</span></div>
+    ${o.ref ? `<div class="raw">${esc(o.libelle)} · ${fmtJA(o.date)} · banque</div>` : ''}
+    ${o.type === 'ajust' ? `<div class="note">Correction ajoutée pour que le solde de Le 31 soit égal à celui de la banque (${fmtJA(o.date)}).</div>` : `
+    <div class="seg seg${kinds.length}" id="opKinds">${kinds.map(([x, l]) => `<button type="button" data-okind="${x}" aria-pressed="${k === x}">${l}</button>`).join('')}</div>
+    ${man ? `<div class="two"><div class="field"><label for="oD">Date</label><input type="date" id="oD" value="${esc(o.date)}"></div><div class="field"><label for="oA">Montant (€)</label><input id="oA" inputmode="decimal" value="${fr(Math.abs(v))}"></div></div>
+      <div class="field"><label for="oL">Libellé</label><input id="oL" value="${esc(o.libelle)}"></div>` : `<div class="field"><label for="oN">Nom</label><input id="oN" value="${esc(nameOf(o))}"></div>`}
+    <div class="field" data-for="fixe" ${k === 'fixe' ? '' : 'hidden'}><label for="oR">Charge fixe</label><select id="oR">${recs.map(r => `<option value="${esc(r.id)}" ${r.id === o.lien ? 'selected' : ''}>${esc(r.libelle)} · le ${esc(r.jour)}</option>`).join('')}<option value="" ${!recOf(o.lien) ? 'selected' : ''}>Nouvelle charge fixe (avec ce nom)</option></select></div>
+    <div class="field" data-for="cat" ${k === 'ponct' || k === 'fixe' ? '' : 'hidden'}><label for="oC">Catégorie</label>${catSelect(acc, o.categorie, 'oC')}</div>
+    ${livretsOf(acc).length ? `<div class="field" data-for="liv" ${k === 'epargne' ? '' : 'hidden'}><label for="oLiv">${v < 0 ? 'Versement vers' : 'Retrait depuis'}</label><select id="oLiv">${livretsOf(acc).map(L => `<option value="${esc(L.id)}" ${L.id === o.livret ? 'selected' : ''}>${livName(L)}</option>`).join('')}</select></div>` : ''}`}
+    <div class="actions">${man ? `<button type="button" class="btn danger" data-odel="${esc(o.id)}">Supprimer</button>` : o.type === 'ajust' ? `<button type="button" class="btn danger" data-odel="${esc(o.id)}">Supprimer</button>` : ''}<button class="btn" type="submit">Enregistrer</button></div>
     <div id="confirmBox"></div></form>`);
 }
-// Séparer un même libellé bancaire en deux catégories selon le montant (ex. MAGASIN U : courses ou carburant)
+// Saisie à la main : réalisée (ponctuel) ou prévue
+function addSheet(acc, p) {
+  const v = p ? num(p.montant) || 0 : -1, isP = !!p;
+  openSheet(`<form class="form" id="addForm" data-acc="${esc(acc)}" data-pid="${esc(p ? p.id : '')}" novalidate>
+    <h2>${p ? 'Opération prévue' : 'Saisir · ' + esc(shortAcc(acc))}</h2>
+    <div class="seg" id="addSens"><button type="button" data-asens="-" aria-pressed="${v < 0}">Dépense</button><button type="button" data-asens="+" aria-pressed="${v > 0}">Rentrée</button></div>
+    <div class="amountbox"><input id="aA" inputmode="decimal" placeholder="0" value="${p ? fr(Math.abs(v)) : ''}"><span>€</span></div>
+    <div class="field"><label for="aL">Libellé</label><input id="aL" value="${esc(p ? p.libelle : '')}" placeholder="Ex. Cadeau"></div>
+    <div class="two"><div class="field"><label for="aD">Date</label><input type="date" id="aD" value="${esc(p ? p.date : TODAY_ISO)}"></div><div class="field"><label for="aC">Catégorie</label>${catSelect(acc, p ? p.categorie : '', 'aC')}</div></div>
+    ${livSelect(acc, p ? p.livret : '', 'aLiv')}
+    ${p ? `<label class="check"><input type="checkbox" id="aDone" ${p.etat ? 'checked' : ''}><span>Réalisée (ne compte plus dans l'atterrissage)</span></label>` : `<label class="check"><input type="checkbox" id="aPrev"><span><b>Prévue</b> (pas encore passée) : compte dans l'atterrissage jusqu'à ce que la banque la voie</span></label>`}
+    <div class="actions">${p ? `<button type="button" class="btn danger" data-pdel="${esc(p.id)}">Supprimer</button>` : ''}<button class="btn" type="submit">Enregistrer</button></div>
+    ${isP ? '' : '<p class="hint">Avec la banque reliée, inutile de saisir ce qu\'elle va remonter : une saisie est reconnue quand la banque voit le même montant à ± 4 jours.</p>'}</form>`);
+}
+// Charge fixe (récurrente)
+function recSheet(acc, r) {
+  openSheet(`<form class="form" id="recForm" data-acc="${esc(acc)}" data-id="${esc(r ? r.id : '')}" novalidate>
+    <h2>${r ? 'Charge fixe' : 'Nouvelle charge fixe'}</h2>
+    <div class="seg" id="recSens"><button type="button" data-rsens="-" aria-pressed="${!r || r.sens !== '+'}">Charge / virement</button><button type="button" data-rsens="+" aria-pressed="${!!r && r.sens === '+'}">Rentrée</button></div>
+    <div class="field"><label for="rL">Nom</label><input id="rL" value="${esc(r ? r.libelle : '')}" placeholder="Ex. Orange"></div>
+    <div class="two"><div class="field"><label for="rA">Montant (€)</label><input id="rA" inputmode="decimal" value="${r ? fr(r.montant) : ''}"></div><div class="field"><label for="rJ">Jour du mois</label><input id="rJ" inputmode="numeric" value="${esc(r ? r.jour : '')}"></div></div>
+    <div class="field"><label for="rC">Catégorie</label>${catSelect(acc, r ? r.categorie : '', 'rC')}</div>
+    ${livSelect(acc, r ? r.livret : '', 'rLiv')}
+    <div class="two"><div class="field"><label for="rD">Début</label><input type="date" id="rD" value="${esc(r ? r.debut : (curCycle(acc) || {}).debut || TODAY_ISO)}"></div><div class="field"><label for="rF">Fin (facultatif)</label><input type="date" id="rF" value="${esc(r ? r.fin : '')}"></div></div>
+    ${r ? `<label class="switch" for="rOn"><span>Active</span><input type="checkbox" id="rOn" ${bool(r.actif) ? 'checked' : ''}></label>` : ''}
+    ${r && r.motif ? `<div class="hint">Reconnue à la banque sous « ${esc(r.motif.replace(/^\+/, ''))} ».</div>` : ''}
+    <div class="actions">${r ? `<button type="button" class="btn danger" data-rdel="${esc(r.id)}">Supprimer</button>` : ''}<button class="btn" type="submit">Enregistrer</button></div><div id="confirmBox"></div></form>`);
+}
+function budSheet(acc, b) {
+  openSheet(`<form class="form" id="budForm" data-acc="${esc(acc)}" data-id="${esc(b ? b.id : '')}" novalidate>
+    <h2>${b ? esc(b.nom) : 'Nouveau budget'}</h2>
+    <div class="field"><label for="bN">Catégorie</label><input id="bN" value="${esc(b ? b.nom : '')}" placeholder="Ex. Courses"></div>
+    <div class="field"><label for="bB">Budget par cycle (€)</label><input id="bB" inputmode="decimal" value="${b ? fr(b.budget) : ''}" placeholder="vide = catégorie sans budget"></div>
+    <div class="actions">${b ? `<button type="button" class="btn danger" data-bdel="${esc(b.id)}">Supprimer</button>` : ''}<button class="btn" type="submit">Enregistrer</button></div>
+    <div class="hint">Supprimer une catégorie ne change pas les opérations déjà classées.</div><div id="confirmBox"></div></form>`);
+}
+function cycSheet(acc, c) {
+  const R = cycleCalc(acc, c), P = isPerso(acc), k = departKind(c);
+  openSheet(`<form class="form" id="cycForm" data-acc="${esc(acc)}" data-mois="${esc(c.mois)}" novalidate>
+    <h2>Cycle ${deMois(c.mois)} ${pm(c.mois).y}</h2>
+    ${c.sal ? `<div class="note good">${P ? 'Salaire' : esc(salLabel(acc))} vu à la banque le <b>${fmtJA(c.sal.date)}</b> (${eurM(num(c.sal.montant))}).</div>` : ''}
+    <div class="two"><div class="field"><label for="cyD">${P ? 'Date du salaire' : 'Date du virement'}</label><input type="date" id="cyD" value="${esc(c.debut)}" ${c.i === 0 ? 'disabled' : ''}></div>
+    <div class="field"><label for="cyM">${P ? 'Salaire de base (€)' : 'Montant (€)'}</label><input id="cyM" inputmode="decimal" value="${fr(c.base)}"></div></div>
+    ${c.detail.rappel || c.detail.primes.length ? `<div class="note">Paie attendue : ${eurM(c.base)}${c.detail.rappel ? ' + rattrapage ' + eurM(c.detail.rappel) : ''}${c.detail.primes.map(p => ' + ' + esc(p.nom.toLowerCase()) + ' ' + eurM(p.v)).join('')} = <b>${eurM(c.montant)}</b></div>` : ''}
+    <div class="field"><label for="cyS">Solde de départ (vide = automatique)</label><input id="cyS" inputmode="decimal" value="${c.man.includes('s') || c.man.includes('b') ? fr(c.row.soldeDepart) : ''}" placeholder="automatique : ${esc(eurM(R.depart))}"></div>
+    <div class="hint">Solde juste avant ${P ? 'le salaire' : 'le virement'}. Automatique : ${c.i === 0 ? 'solde lu à la banque au démarrage' : 'fin réelle du cycle précédent quand il est fini, sinon son atterrissage avec budget'}. Actuellement : <b>${esc(k)}</b>.${c.i === 0 ? ' La date de début du suivi ne se change pas ici (Réglages > Recommencer le suivi).' : ''}</div>
+    <div class="actions">${c.man ? `<button type="button" class="btn ghost" data-cyauto="${esc(c.mois)}">Tout en automatique</button>` : ''}<button class="btn" type="submit">Enregistrer</button></div></form>`);
+}
 function seuilSheet(o) {
-  const acc = o.compte, key = keyOf(o.libelle), cur = seuilRule(acc, o.libelle), cats = catsOf(acc).map(c => c.nom);
-  const v = cur || { s: Math.round(Math.abs(num(o.montant) || 0)), bas: '', haut: o.categorie || '' };
-  openSheet(`<form class="form" id="seuilForm" data-acc="${esc(acc)}" data-key="${esc(key)}" novalidate>
-    <h2>Séparer « ${esc(nameOf(o))} » par le montant</h2>
-    <div class="hint">Utile quand la banque donne le même libellé à deux usages différents (ex. « MAGASIN U » pour les courses et le carburant). En dessous ou égal au seuil : une catégorie ; au-dessus : l'autre. S'applique tout de suite aux opérations déjà importées de ce marchand sur ce compte, et aux prochaines (import comme banque).</div>
-    <div class="field"><label for="seS">Seuil (€)</label><input id="seS" inputmode="decimal" value="${fr(v.s)}"></div>
-    <div class="two"><div class="field"><label for="seBas">Montant ≤ seuil</label><input id="seBas" list="seCl" value="${esc(v.bas)}" placeholder="Ex. Courses" autocomplete="off"></div>
-    <div class="field"><label for="seHaut">Montant &gt; seuil</label><input id="seHaut" list="seCl" value="${esc(v.haut)}" placeholder="Ex. Carburant" autocomplete="off"></div></div>
-    <datalist id="seCl">${cats.map(c => `<option value="${esc(c)}">`).join('')}</datalist>
-    <div class="actions">${cur ? `<button type="button" class="btn danger" data-seuildel="${esc(acc)}|${esc(key)}">Ne plus séparer</button>` : ''}<button class="btn" type="submit">Enregistrer</button></div>
-    <div id="confirmBox"></div></form>`);
+  const acc = o.compte, key = keyOf(o.libelle), r = ruleOf3(acc, skOf(o)), cats = r ? String(r.categorie || '').split('|').filter(Boolean) : [];
+  openSheet(`<form class="form" id="seuilForm" data-acc="${esc(acc)}" data-key="${esc(key)}" novalidate><h2>Séparer « ${esc(nameOf(o))} » par montant</h2>
+    <div class="field"><label for="seS">Seuil (€)</label><input id="seS" inputmode="decimal" placeholder="Ex. 40"></div>
+    <div class="two"><div class="field"><label for="seBas">Jusqu'au seuil</label><input id="seBas" value="${esc(cats[0] || '')}"></div><div class="field"><label for="seHaut">Au-dessus</label><input id="seHaut" value="${esc(cats[1] || '')}"></div></div>
+    <div class="hint">Ex. Super U : courses jusqu'à 40 €, carburant au-dessus. Chaque opération est ensuite classée seule selon son montant.</div>
+    <button class="btn" type="submit">Enregistrer</button></form>`);
 }
-function balSheet() {
-  const r = curMonth(UI.acc);
-  openSheet(`<form class="form" id="balForm" novalidate><h2>Corriger le solde</h2>
-    <div class="note">Le 31 calcule <b>${eur(r.bal)}</b> aujourd'hui. Indique le solde affiché par la banque : l'écart est enregistré comme correction et toutes les prévisions repartent de là.</div>
-    <div class="amountbox"><input id="realBal" inputmode="decimal" placeholder="${fr(r2(r.bal))}" aria-label="Solde réel" autocomplete="off"><span>€</span></div>
-    <div class="hint">Avant de corriger, pointe les prélèvements passés : un écart vient souvent d'une dépense oubliée.</div>
-    <button class="btn" type="submit">Recaler</button></form>`);
-}
-function closeMonthSheet(k) {
-  const acc = UI.acc, r = calc(acc, k, startOf(acc, k));
-  const rows = r.cats.filter(c => c.budget || c.spent).map(c => { const d = c.budget ? c.spent - c.budget : null; return `<div class="habit"><b>${esc(c.nom)}</b><span>${c.budget ? 'budget ' + eur0(c.budget) : '—'}</span><span style="font-weight:700;color:var(--${d > 0 ? 'bad' : 'ink'})">${eur0(c.spent)}</span></div>`; }).join('');
-  openSheet(`<form class="form" id="closeForm" data-k="${k}" novalidate><h2>Clôturer ${mLabel(k)}</h2>
-    ${rows ? `<div class="list">${rows}</div>` : ''}
-    <div class="kv"><div><small>Solde calculé au ${r.D} ${MONTHS[pm(k).m]}</small><b>${eur(r.end)}</b></div><div><small>Rentrées / sorties</small><b>${eur0(r.rev)} / ${eur0(r.chg + r.vari)}</b></div></div>
-    <div class="field"><label for="clReal">Solde réel du relevé au ${r.D} (si différent)</label><input id="clReal" inputmode="decimal" placeholder="Laisser vide si juste" autocomplete="off"></div>
-    <div class="note">Le mois est archivé : son solde de fin sert de départ au mois suivant et ses dépenses alimentent les habitudes.</div>
-    <button class="btn" type="submit">Clôturer et reporter</button></form>`);
-}
+
+/* ================= Événements ================= */
+document.addEventListener('toggle', ev => { if (ev.target && ev.target.id === 'jpj') { UI.jpj = ev.target.open; store.set('le31-jpj', UI.jpj); } }, true);
+document.addEventListener('click', ev => {
+  const t = ev.target.closest('button,.sheet-bg,input[type=checkbox]'); if (!t) return;
+  if (t.classList.contains('sheet-bg')) { if (ev.target === t) closeSheet(); return; }
+  const ds = t.dataset, acc = UI.acc;
+  if (ds.retry) { pull(); return; }
+  if (ds.closebtn) { closeSheet(); return; }
+  if (ds.acc) { UI.acc = ds.acc; store.set('le31-compte', UI.acc); UI.td = {}; render(); return; }
+  if (ds.tab) { UI.tab = ds.tab; if (ds.tab === 'todo') BK.res = null; render(); scrollTo(0, 0); return; }
+  if (ds.cyc) { const cy = cyclesOf(acc), c = selCycle(acc), n = cy[c.i + (+ds.cyc)]; if (n) UI.cyc[acc] = n.mois; render(); return; }
+  if (ds.jpjall) { UI.jpjAll = !UI.jpjAll; render(); return; }
+  if (ds.autoall) { UI.autoAll = !UI.autoAll; render(); return; }
+  if (ds.tsel) { UI.td = { id: ds.tsel, kind: ds.tk }; render(); const f = $('todoForm'); if (f) f.scrollIntoView({ block: 'start' }); return; }
+  if (ds.tkind) { keepTodoInputs(); UI.td.kind = ds.tkind; if (ds.tkind === 'fixe' && UI.td.rec === undefined) UI.td.rec = ''; render(); return; }
+  if (ds.tcat) { UI.td.cat = UI.td.cat === ds.tcat && ds.tcat !== '__new' ? '' : ds.tcat; document.querySelectorAll('[data-tcat]').forEach(b => b.setAttribute('aria-pressed', b.dataset.tcat === UI.td.cat)); const n = $('tdCatNew'); if (n) { n.hidden = UI.td.cat !== '__new'; if (!n.hidden) n.focus(); } return; }
+  if (ds.seuil) { const o = DB.mouvements.find(x => x.id === ds.seuil); if (o) seuilSheet(o); return; }
+  if (ds.oid) { const o = DB.mouvements.find(x => x.id === ds.oid); if (o) opSheet(o); return; }
+  if (ds.okind !== undefined) { document.querySelectorAll('[data-okind]').forEach(b => b.setAttribute('aria-pressed', b === t)); const f = document.querySelector('[data-for="fixe"]'), c = document.querySelector('[data-for="cat"]'); if (f) f.hidden = ds.okind !== 'fixe'; if (c) c.hidden = !(ds.okind === 'ponct' || ds.okind === 'fixe'); const lv = document.querySelector('[data-for="liv"]'); if (lv) lv.hidden = ds.okind !== 'epargne'; return; }
+  if (ds.txtab) { UI.txTab = ds.txtab; render(); return; }
+  if (ds.txseg) { UI.txSeg = ds.txseg; render(); return; }
+  if (ds.newop) { addSheet(acc, null); return; }
+  if (ds.pid) { const p = DB.prevues.find(x => x.id === ds.pid); if (p) addSheet(p.compte, p); return; }
+  if (ds.asens) { document.querySelectorAll('[data-asens]').forEach(b => b.setAttribute('aria-pressed', b === t)); return; }
+  if (ds.rsens) { document.querySelectorAll('[data-rsens]').forEach(b => b.setAttribute('aria-pressed', b === t)); return; }
+  if (ds.newrec) { recSheet(acc, null); return; }
+  if (ds.rid) { const r = recOf(ds.rid); if (r) recSheet(r.compte, r); return; }
+  if (ds.newbud) { budSheet(acc, null); return; }
+  if (ds.bid) { const b = DB.budgets.find(x => x.id === ds.bid); if (b) budSheet(b.compte, b); return; }
+  if (ds.cycm) { const c = cycleByMois(acc, ds.cycm); if (c) cycSheet(acc, c); return; }
+  if (ds.cyauto) {
+    const id = acc + '|' + ds.cyauto, r = DB.cycles.find(x => x.id === id) || {}, b = String(r.manuel || '').includes('b'), first = ds.cyauto === (v3(acc) || {}).mois;
+    const row = { id, compte: acc, mois: ds.cyauto, manuel: b ? 'b' : '' }; if (!b) row.soldeDepart = ''; if (!first) row.debut = '';
+    commit([upd('Cycles', row)]); closeSheet(); toast('Cycle en automatique'); return;
+  }
+  if (ds.simtab) { UI.simTab = ds.simtab; render(); return; }
+  if (ds.saadd) { simOf(acc).achats.push({ lib: '', date: '', montant: '' }); saveSim(); render(); return; }
+  if (ds.sadel) { simOf(acc).achats.splice(+ds.sadel, 1); saveSim(); render(); return; }
+  if (ds.scadd) { simOf(acc).credits.push({ lib: '', mens: '', debut: '', fin: '', remplace: '', frais: '' }); saveSim(); render(); return; }
+  if (ds.scdel) { simOf(acc).credits.splice(+ds.scdel, 1); saveSim(); render(); return; }
+  if (ds.reset) { $('rs-' + ds.reset).innerHTML = `<div class="alert bad" style="display:flex;justify-content:space-between;align-items:center;gap:8px">Tout effacer pour ce compte et redémarrer ?<button class="btn danger small" data-resetok="${esc(ds.reset)}">Effacer</button></div>`; return; }
+  if (ds.resetok) { commit(resetOps3(ds.resetok)); UI.tab = 'home'; UI.acc = ds.resetok; toast('Suivi effacé : choisis la nouvelle date de début'); render(); return; }
+  if (ds.syncnow) { QUEUE.length ? flush() : pull(); toast('Synchronisation lancée'); return; }
+  if (ds.iosok) { JOIN.iosOk = true; join(); return; }
+  if (ds.joinretry) { JOIN.err = ''; join(); return; }
+  if (ds.onbmode) { ONB.mode = ds.onbmode; render(); return; }
+  if (ds.onbstep) {
+    const P = $('onbP'); if (P) ONB.partner = P.value.trim();
+    if (ds.onbstep === '2' && (!ONB.mode || (ONB.mode === 'duo' && !ONB.partner))) { toast(ONB.mode ? 'Indique le prénom de ton/ta partenaire' : 'Choisis seul ou à deux'); return; }
+    ONB.step = +ds.onbstep; render(); return;
+  }
+  if (ds.onbdone) { finishOnboard(); return; }
+  if (ds.bklink) { BK.view = 'bank'; BK.acc = ds.bklink; BK.q = ''; render(); scrollTo(0, 0); if (!BK.list) api({ action: 'banques' }).then(j => { BK.list = j.banques; render(); }).catch(e => { toast('Banque : ' + e.message); BK.view = null; render(); }); return; }
+  if (ds.bkbank) { bankStart(BK.acc, ds.bkbank); return; }
+  if (ds.bkrenew) { const r = bkRow(ds.bkrenew); if (r) bankStart(ds.bkrenew, r.aspsp); return; }
+  if (ds.bkunlink) { t.outerHTML = `<button class="btn danger small" data-bkunlinkok="${esc(ds.bkunlink)}">Confirmer</button>`; return; }
+  if (ds.bkunlinkok) { bankUnlink(ds.bkunlinkok); return; }
+  if (ds.bksync) { bankSync({ force: true }); return; }
+  if (ds.bkok) { BK.res = null; render(); return; }
+  if (ds.bkclose) { BK.view = null; BK.msg = ''; if (bkPend()) bankLinkCancel(); render(); return; }
+  if (ds.bklier) { bankLink(); return; }
+  if (ds.invite) { invite(ds.invite); return; }
+  if (ds.cut || ds.cutall) {
+    openSheet(`<div class="form"><h2>Couper ${ds.cut ? 'cet appareil' : 'tous les accès'} de ${esc(ds.cutname)} ?</h2>
+      <div class="note warn">${ds.cut ? 'Cet appareil ne pourra plus rien voir ni saisir, tout de suite.' : 'Tous ses appareils seront déconnectés et ses liens en attente annulés.'} Les données restent intactes.</div>
+      <div class="actions"><button class="btn ghost" data-closebtn="1">Annuler</button><button class="btn danger" data-cutok="${esc(ds.cut || '')}" data-cutprof="${esc(ds.cutall || '')}">Couper l'accès</button></div></div>`);
+    return;
+  }
+  if ('cutok' in ds) { cutAccess(ds.cutok ? { acces: ds.cutok } : { profil: ds.cutprof }, 'Accès coupé'); return; }
+  if (ds.copyshare) { const tx = $('shareTxt'); copyText(tx.value, tx); return; }
+  if (ds.doshare) { const tx = $('shareTxt').value; if (navigator.share) navigator.share({ text: tx }).then(() => { closeSheet(); toast('Lien partagé'); }).catch(() => {}); else copyText(tx, $('shareTxt')); return; }
+  const box = () => $('confirmBox'), conf = (txt, attr, id) => { box().innerHTML = `<div class="alert bad" style="display:flex;justify-content:space-between;align-items:center;gap:8px">${txt}<button type="button" class="btn danger small" data-${attr}="${esc(id)}">Supprimer</button></div>`; };
+  if (ds.odel) { conf('Supprimer cette opération ?', 'odelok', ds.odel); return; }
+  if (ds.odelok) { commit([del('Mouvements', ds.odelok)]); closeSheet(); toast('Opération supprimée'); return; }
+  if (ds.pdel) { commit([del('Prevues', ds.pdel)]); closeSheet(); toast('Prévue supprimée'); return; }
+  if (ds.rdel) { conf('Les opérations déjà classées en fixe repasseront à classer.', 'rdelok', ds.rdel); return; }
+  if (ds.rdelok) { const ops = [del('Recurrents', ds.rdelok)]; DB.mouvements.filter(o => o.type === 'fixe' && o.lien === ds.rdelok).forEach(o => ops.push(upd('Mouvements', { id: o.id, type: '', lien: '', auto: '' }))); commit(ops); closeSheet(); toast('Charge fixe supprimée'); return; }
+  if (ds.bdel) { commit([del('Budgets', ds.bdel)]); closeSheet(); toast('Catégorie supprimée'); return; }
+});
+const refocus = id => { const e = $(id); if (e) { e.focus(); const n = e.value.length; try { e.setSelectionRange(n, n); } catch (x) {} } };
+let qT;
+document.addEventListener('input', ev => {
+  const ds = ev.target.dataset || {};
+  if (ds.sa !== undefined || ds.sc !== undefined) { const L = ds.sa !== undefined ? simOf(UI.acc).achats[+ds.sa] : simOf(UI.acc).credits[+ds.sc]; L[ds.f] = ev.target.value; saveSim(); clearTimeout(qT); qT = setTimeout(simRefresh, 250); return; }
+  if (ev.target.id === 'bkQ') { BK.q = ev.target.value; clearTimeout(qT); qT = setTimeout(() => { render(); refocus('bkQ'); }, 200); return; }
+});
+document.addEventListener('change', ev => {
+  const el = ev.target, ds = el.dataset;
+  if (ds.themeAuto) { UI.theme = el.checked ? 'auto' : (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'); applyTheme(); render(); return; }
+  if (ds.themeDark) { UI.theme = el.checked ? 'dark' : 'light'; applyTheme(); render(); return; }
+  if (el.id === 'stBk') { $('stSWrap').hidden = el.checked; return; }
+  if (el.tagName === 'SELECT' && el.value === '__new' && $(el.id + 'New')) { $(el.id + 'New').hidden = false; $(el.id + 'New').focus(); return; }
+  if (el.id === 'tdRec') { keepTodoInputs(); render(); return; }
+  if (ds.sa !== undefined) { simOf(UI.acc).achats[+ds.sa][ds.f] = el.value; saveSim(); simRefresh(); return; }
+  if (ds.sc !== undefined) { simOf(UI.acc).credits[+ds.sc][ds.f] = el.value; saveSim(); simRefresh(); return; }
+  if (ds.accname) { const v = el.value.trim(); if (v) commit([upd('Comptes', { id: ds.accname, nom: v })]); return; }
+  if (ds.prof) { const v = el.value.trim(); if (v) commit([upd('Profils', { id: ds.prof, nom: v })]); return; }
+  if (ds.cfj) { const j = Math.min(31, Math.max(1, num(el.value) || 26)), S = v3(ds.cfj); const S2 = Object.assign({}, S, { jour: j }); if (S) commit([DB.reglages.some(r => r.id === ds.cfj + '|v3') ? regOp(ds.cfj, 'v3', S2) : upd('Parametres', { cle: 'v3|' + ds.cfj, valeur: JSON.stringify(S2) })]); return; }
+  if (ds.cfn) { commit([upd('Parametres', { cle: 'v3nomrev|' + ds.cfn, valeur: el.value.trim() })]); return; }
+  if (el.id === 'onbC') { ONB.commun = el.checked; return; }
+  if (ds.bksel) { BK.sel[ds.bksel] = el.value; render(); return; }
+  if (el.id === 'bkAuto') { BK.auto = el.checked; store.set('le31-bk-auto', BK.auto); return; }
+});
+document.addEventListener('submit', ev => {
+  ev.preventDefault(); const f = ev.target;
+  if (f.id === 'keyForm') {
+    if (!readLink($('keyIn').value.trim())) { toast("Lien non reconnu : il doit contenir #inv="); return; }
+    if (!apiOk()) { toast("Le lien ne contient pas l'adresse du serveur : refais-le"); return; }
+    JOIN.iosOk = true; JOIN.err = ''; SYNC.error = ''; join(); return;
+  }
+  if (f.id === 'onbName') { const n = $('onbN').value.trim(); if (!n) { toast('Indique ton prénom'); return; } ONB.name = n; ONB.step = 1; render(); return; }
+  if (f.id === 'startForm') { startAccount(f.dataset.acc); return; }
+  if (f.id === 'todoForm') {
+    const o = DB.mouvements.find(x => x.id === f.dataset.id); if (!o) return;
+    keepTodoInputs(); const h = readTodo(o);
+    if (h.type === 'ponct' && !h.categorie) { toast('Choisis une catégorie'); return; }
+    if (h.type === 'fixe' && !h.recId && !(h.newRec.montant > 0)) { toast('Indique le montant habituel'); return; }
+    commit(classifyOps(o, h)); UI.td = {}; toast('Classée'); return;
+  }
+  if (f.id === 'opForm') {
+    const o = DB.mouvements.find(x => x.id === f.dataset.id); if (!o) { closeSheet(); return; }
+    if (o.type === 'ajust') { closeSheet(); return; }
+    const kb = f.querySelector('[data-okind][aria-pressed=true]'), type = kb ? kb.dataset.okind : (o.type || '');
+    const ops = [];
+    if (!o.ref) { // saisie à la main : date, montant, libellé modifiables
+      const a = num($('oA').value), dt = $('oD').value; if (!(a > 0) || !/^\d{4}-\d{2}-\d{2}$/.test(dt)) { toast('Indique la date et le montant'); return; }
+      const neg = (num(o.montant) || 0) < 0; o.montant = r2(neg ? -a : a); o.date = dt; o.libelle = $('oL').value.trim() || o.libelle;
+      ops.push(upd('Mouvements', { id: o.id, montant: o.montant, date: dt, libelle: o.libelle }));
+    }
+    if (!type) ops.push(upd('Mouvements', { id: o.id, type: '', lien: '', categorie: '', auto: '', nom: '' }));
+    else {
+      const cat = readCat('oC'), nom = $('oN') ? $('oN').value.trim() : '';
+      const h = { type, categorie: cat, nom: nom && nom !== smartName(o.libelle || '') ? nom : '' };
+      if (type === 'fixe') { h.recId = $('oR').value; if (!h.recId) h.newRec = { libelle: nom || nameOf(o), jour: +o.date.slice(8, 10), montant: Math.abs(num(o.montant) || 0) }; }
+      if (type === 'epargne') { h.livret = $('oLiv') ? $('oLiv').value : ''; h.categorie = 'Épargne'; }
+      ops.push(...classifyOps(o, h));
+    }
+    commit(ops); closeSheet(); toast('Opération mise à jour'); return;
+  }
+  if (f.id === 'addForm') {
+    const acc = f.dataset.acc, a = num($('aA').value), dt = $('aD').value, lb = $('aL').value.trim(), cat = readCat('aC');
+    const neg = (f.querySelector('[data-asens][aria-pressed=true]') || {}).dataset.asens !== '+';
+    if (!(a > 0)) { toast('Indique un montant'); return; } if (!/^\d{4}-\d{2}-\d{2}$/.test(dt)) { toast('Indique une date'); return; }
+    const v = r2(neg ? -a : a), ops = cat ? newCatOps(acc, cat) : [];
+    const liv = $('aLiv') ? $('aLiv').value : '';
+    if (f.dataset.pid) ops.push(upd('Prevues', { id: f.dataset.pid, date: dt, libelle: lb || cat || 'Prévue', montant: v, categorie: cat, etat: $('aDone').checked ? 'realisee' : '', livret: liv }));
+    else if ($('aPrev').checked) ops.push(upd('Prevues', { id: uid(), compte: acc, date: dt, libelle: lb || cat || 'Prévue', montant: v, categorie: cat, etat: '', lien: '', livret: liv }));
+    else ops.push(upd('Mouvements', { id: uid(), compte: acc, date: dt, montant: v, libelle: lb || cat || 'Opération', nom: '', categorie: cat || (liv ? 'Épargne' : ''), type: liv ? 'epargne' : 'ponct', lien: '', auto: '', ref: '', profil: ME || '', livret: liv }));
+    commit(ops); closeSheet(); toast('Enregistré'); return;
+  }
+  if (f.id === 'recForm') {
+    const acc = f.dataset.acc, a = num($('rA').value), j = num($('rJ').value), l = $('rL').value.trim(), cat = readCat('rC');
+    if (!l || !(a > 0) || !(j >= 1 && j <= 31)) { toast('Indique le nom, le montant et le jour (1 à 31)'); return; }
+    const sens = (f.querySelector('[data-rsens][aria-pressed=true]') || {}).dataset.rsens || '-';
+    const row = { id: f.dataset.id || uid(), compte: acc, libelle: l, montant: r2(a), sens, jour: j, categorie: cat, debut: $('rD').value, fin: $('rF').value, actif: $('rOn') ? ($('rOn').checked ? 'oui' : 'non') : 'oui', livret: $('rLiv') ? $('rLiv').value : '' };
+    if (!f.dataset.id) row.motif = '';
+    commit([...(cat ? newCatOps(acc, cat) : []), upd('Recurrents', row)]); closeSheet(); toast('Charge fixe enregistrée'); return;
+  }
+  if (f.id === 'budForm') {
+    const acc = f.dataset.acc, n = $('bN').value.trim(), b = num($('bB').value); if (!n) { toast('Indique la catégorie'); return; }
+    const ex = f.dataset.id && DB.budgets.find(x => x.id === f.dataset.id), ops = [];
+    ops.push(upd('Budgets', { id: f.dataset.id || uid(), compte: acc, nom: n, budget: b === null ? '' : r2(b), ordre: ex ? ex.ordre : Math.max(0, ...budgetsOf(acc).map(x => num(x.ordre) || 0)) + 1 }));
+    if (ex && ex.nom !== n) { // renommer : les opérations, fixes et règles suivent
+      DB.mouvements.filter(o => o.compte === acc && o.categorie === ex.nom).forEach(o => ops.push(upd('Mouvements', { id: o.id, categorie: n })));
+      DB.recurrents.filter(r => r.compte === acc && r.categorie === ex.nom).forEach(r => ops.push(upd('Recurrents', { id: r.id, categorie: n })));
+      DB.apprentissage.filter(r => r.compte === acc && String(r.categorie).split('|').includes(ex.nom)).forEach(r => ops.push(upd('Apprentissage', { id: r.id, categorie: String(r.categorie).split('|').map(x => x === ex.nom ? n : x).join('|') })));
+    }
+    commit(ops); closeSheet(); toast('Budget enregistré'); return;
+  }
+  if (f.id === 'cycForm') {
+    const acc = f.dataset.acc, k = f.dataset.mois, c = cycleByMois(acc, k), d = $('cyD').value, m = num($('cyM').value), sRaw = $('cyS').value.trim(), s = num(sRaw);
+    const man = new Set(String(c.row.manuel || '').split('').filter(x => x !== 'b' || !sRaw)), row = { id: acc + '|' + k, compte: acc, mois: k };
+    if (c.i > 0 && /^\d{4}-\d{2}-\d{2}$/.test(d) && d !== c.debut) { row.debut = d; man.add('d'); }
+    if (m !== null && r2(m) !== r2(c.base)) { row.montant = r2(m); man.add('m'); }
+    if (sRaw && s !== null) { row.soldeDepart = r2(s); if (!(c.man.includes('b') && r2(s) === r2(num(c.row.soldeDepart)))) { man.delete('b'); man.add('s'); } }
+    else if (!sRaw && !c.man.includes('b')) { row.soldeDepart = ''; man.delete('s'); }
+    row.manuel = [...man].join('');
+    if (c.i === 0) row.debut = c.debut;
+    commit([upd('Cycles', row)]); closeSheet(); toast('Cycle enregistré'); return;
+  }
+  if (f.id === 'seuilForm') {
+    const acc = f.dataset.acc, key = f.dataset.key, s = num($('seS').value), bas = $('seBas').value.trim(), haut = $('seHaut').value.trim();
+    if (s === null || s <= 0 || !bas || !haut) { toast('Indique un seuil et les deux catégories'); return; }
+    commit([...newCatOps(acc, bas), ...newCatOps(acc, haut), upd('Parametres', { cle: 'seuilCat|' + acc + '|' + key, valeur: JSON.stringify({ s: r2(s), bas, haut }) })]);
+    closeSheet(); UI.td.cat = undefined; toast('Séparation enregistrée'); return;
+  }
+  if (f.id === 'profForm') {
+    const n = $('pfnew').value.trim(); if (!n) { toast('Indique un prénom'); return; }
+    const id = 'p' + uid();
+    commit([upd('Profils', { id, nom: n, perso: $('pfperso').checked ? 'oui' : 'non', ordre: Math.max(0, ...DB.profils.map(p => num(p.ordre) || 0)) + 1 })]);
+    setTimeout(() => invite(id), 400); return;
+  }
+});
+
+/* ================= V3.1 : événements (évolution du salaire, épargne, mois par mois) ================= */
+document.addEventListener('toggle', ev => {
+  const id = ev.target && ev.target.id;
+  if (id === 'mpm') { UI.mpmOpen = ev.target.open; store.set('le31-mpmo', UI.mpmOpen); }
+  if (id === 'epmpm') { UI.epMpmOpen = ev.target.open; store.set('le31-epmo', UI.epMpmOpen); }
+}, true);
+document.addEventListener('click', ev => {
+  const t = ev.target.closest('button'); if (!t) return;
+  const ds = t.dataset, acc = UI.acc;
+  if (ds.gocyc) { UI.cyc[acc] = ds.gocyc; render(); scrollTo(0, 0); return; }
+  if (ds.mpm) { UI.mpm = ds.mpm; store.set('le31-mpm', UI.mpm); render(); return; }
+  if (ds.epmpm) { UI.epMpm = ds.epmpm; store.set('le31-epmpm', UI.epMpm); render(); return; }
+  if (ds.eps) { UI.epS = ds.eps; render(); return; }
+  if (ds.epm) { UI.epM = addM(UI.epM || CUR, +ds.epm); render(); return; }
+  if (ds.epgo) { UI.epM = ds.epgo; render(); if (UI.tab === 'epa') scrollTo(0, 0); return; }
+  if (ds.livid) { UI.epL = ds.livid; UI.tab = 'epl'; UI.eplAll = false; render(); scrollTo(0, 0); return; }
+  if (ds.eplall) { UI.eplAll = !UI.eplAll; render(); return; }
+  if (ds.newliv) { livSheet(acc, null); return; }
+  if (ds.livedit) { const L = livOf(ds.livedit); if (L) livSheet(L.compte, L); return; }
+  if (ds.livdel) { $('confirmBox').innerHTML = `<div class="alert bad" style="display:flex;justify-content:space-between;align-items:center;gap:8px">Supprimer ce livret ? Les opérations restent, sans lien.<button type="button" class="btn danger small" data-livdelok="${esc(ds.livdel)}">Supprimer</button></div>`; return; }
+  if (ds.livdelok) {
+    const id = ds.livdelok, ops = [del('Livrets', id)];
+    DB.recurrents.filter(r => r.livret === id).forEach(r => ops.push(upd('Recurrents', { id: r.id, livret: '' })));
+    DB.prevues.filter(p => p.livret === id).forEach(p => ops.push(upd('Prevues', { id: p.id, livret: '' })));
+    DB.mvtsLivret.filter(m => m.livret === id).forEach(m => ops.push(del('MvtsLivret', m.id)));
+    DB.mouvements.filter(o => o.livret === id).forEach(o => ops.push(upd('Mouvements', o.type === 'epargne' ? { id: o.id, livret: '', type: '', auto: '' } : { id: o.id, livret: '' })));
+    UI.tab = 'epa'; commit(ops); closeSheet(); toast('Livret supprimé'); return;
+  }
+  if (ds.mvlnew) { const L = livOf(ds.mvlnew); if (L) mvlSheet(L, null); return; }
+  if (ds.mvlid) { const m = DB.mvtsLivret.find(x => x.id === ds.mvlid); if (m && livOf(m.livret)) mvlSheet(livOf(m.livret), m); return; }
+  if (ds.mvldel) { commit([del('MvtsLivret', ds.mvldel)]); closeSheet(); toast('Mouvement supprimé'); return; }
+  if (ds.mvlt) { document.querySelectorAll('[data-mvlt]').forEach(b => b.setAttribute('aria-pressed', b === t)); return; }
+  if (ds.tliv) { UI.td.liv = ds.tliv; document.querySelectorAll('[data-tliv]').forEach(b => b.setAttribute('aria-pressed', b.dataset.tliv === ds.tliv)); return; }
+  if (ds.caltab) { UI.calTab = ds.caltab; render(); return; }
+  if (ds.evohadd) { saveEvo(acc, P => { P.hausses = P.hausses || {}; const ys = Object.keys(P.hausses).map(Number); const y = ys.length ? Math.max(...ys) + 1 : pm(CUR).y + 1; P.hausses[y] = ys.length ? P.hausses[Math.max(...ys)] : 2; }); return; }
+  if (ds.evohdel) { saveEvo(acc, P => { delete P.hausses[ds.evohdel]; }); return; }
+  if (ds.evpadd) { saveEvo(acc, P => { (P.primes = P.primes || []).push({ id: uid(), nom: 'Prime', type: 'part', mois: 12, jour: 15, montants: {} }); }); return; }
+  if (ds.evpdel) { saveEvo(acc, P => { P.primes = (P.primes || []).filter(p => p.id !== ds.evpdel); }); return; }
+});
+document.addEventListener('change', ev => {
+  const el = ev.target, ds = el.dataset || {}, acc = UI.acc;
+  if (ds.colseuil || ds.colmarge) { const a = ds.colseuil || ds.colmarge, S = colSet(a), v = num(el.value);
+    if (ds.colseuil) S.seuil = v === null ? 100 : Math.max(0, r2(v)); else S.marge = v === null ? 10 : Math.max(0, Math.min(100, Math.round(v)));
+    commit([regOp(a, 'couleurs', S)]); render(); return; }
+  if (ds.evo) { saveEvo(acc, P => { P[ds.evo] = +el.value; }); return; }
+  if (ds.evoh) { const v = num(el.value); saveEvo(acc, P => { P.hausses = P.hausses || {}; if (v === null) delete P.hausses[ds.evoh]; else P.hausses[ds.evoh] = v; }); return; }
+  if (ds.evp) { saveEvo(acc, P => { const p = (P.primes || []).find(x => x.id === ds.evp); if (!p) return; p[ds.f] = ds.f === 'mois' || ds.f === 'jour' ? +el.value || '' : el.value.trim(); }); return; }
+  if (ds.evpm) { const v = num(el.value); saveEvo(acc, P => { const p = (P.primes || []).find(x => x.id === ds.evpm); if (!p) return; p.montants = p.montants || {}; if (v === null) delete p.montants[ds.y]; else p.montants[ds.y] = v; }); return; }
+});
+document.addEventListener('submit', ev => {
+  const f = ev.target; ev.preventDefault();
+  if (f.id === 'epaStart') { const ops = startEpaOps(f.dataset.acc); if (ops) { commit(ops); toast('Épargne démarrée'); } return; }
+  if (f.id === 'livForm') {
+    const acc = f.dataset.acc, n = $('lvN').value.trim(), d = $('lvD').value; if (!n || !/^\d{4}-\d{2}-\d{2}$/.test(d)) { toast('Indique le nom et la date du point zéro'); return; }
+    const L = { id: f.dataset.id || uid(), compte: acc, nom: n, type: $('lvT').value, pointZero: r2(num($('lvZ').value) || 0), dateZero: d, objectif: num($('lvO').value) === null ? '' : r2(num($('lvO').value)), actif: 'oui' };
+    if (!f.dataset.id) L.ordre = Math.max(0, ...livretsOf(acc).map(x => num(x.ordre) || 0)) + 1;
+    const ops = [upd('Livrets', L)]; if (!f.dataset.id) ops.push(...linkOps(acc, [L]));
+    commit(ops); closeSheet(); toast('Livret enregistré'); return;
+  }
+  if (f.id === 'mvlForm') {
+    const L = livOf(f.dataset.l), a = num($('mvA').value), d = $('mvD').value, t = (f.querySelector('[data-mvlt][aria-pressed=true]') || {}).dataset.mvlt || 'vers';
+    if (!L || !(a > 0) || !/^\d{4}-\d{2}-\d{2}$/.test(d)) { toast('Indique le montant et la date'); return; }
+    commit([upd('MvtsLivret', { id: f.dataset.id || uid(), compte: L.compte, livret: L.id, date: d, montant: r2(t === 'retr' ? -a : a), type: t === 'int' ? 'interets' : t === 'retr' ? 'retrait' : 'versement', libelle: $('mvL').value.trim() || (t === 'int' ? 'Intérêts' : t === 'retr' ? 'Retrait' : 'Versement') })]);
+    closeSheet(); toast('Mouvement enregistré'); return;
+  }
+  if (f.id === 'recalForm') {
+    const L = livOf(f.dataset.l), v = num($('rcV').value); if (!L || v === null) { toast('Indique le solde réel'); return; }
+    const delta = r2(v - livSolde(L, TODAY_ISO)); if (Math.abs(delta) < 0.005) { toast('Déjà juste'); return; }
+    commit([upd('MvtsLivret', { id: uid(), compte: L.compte, livret: L.id, date: TODAY_ISO, montant: delta, type: 'interets', libelle: 'Intérêts (recalage)' })]);
+    toast('Recalé : ' + sgn(delta) + ' en intérêts'); return;
+  }
+});
 function copyText(txt, el) {
   const done = () => toast('Copié');
   const fallback = () => { if (el) { el.focus(); el.select(); el.setSelectionRange && el.setSelectionRange(0, 99999); } try { document.execCommand('copy'); done(); } catch (e) { toast('Sélectionne le texte et copie-le'); } };
@@ -1976,306 +2009,6 @@ function applyTheme() {
   const m = $('themeColor'); if (m) m.setAttribute('content', dark ? '#0D1120' : '#EDF0F6');
 }
 matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => { applyTheme(); if (UI.tab === 'set') render(); });
-
-/* ================= Événements ================= */
-document.addEventListener('click', ev => {
-  const bm = ev.target.closest && ev.target.closest('[data-bm]'); if (bm) { BIL.sel = BIL.sel === bm.dataset.bm ? null : bm.dataset.bm; render(); return; }
-  const t = ev.target.closest('button,.sheet-bg,input[type=checkbox]'); if (!t) return;
-  if (t.classList.contains('sheet-bg')) { if (ev.target === t) closeSheet(); return; }
-  const ds = t.dataset;
-  if (ds.retry) { pull(); return; }
-  if (ds.acc) { UI.acc = ds.acc; store.set('le31-compte', UI.acc); render(); return; }
-  if (ds.tab) { UI.tab = ds.tab; render(); scrollTo(0, 0); return; }
-  if (ds.go) { UI.tab = ds.go; render(); scrollTo(0, 0); return; }
-  if (ds.ftab) { UI.foreTab = ds.ftab; render(); return; }
-  if (ds.mode) { UI.mode = ds.mode; render(); return; }
-  if (ds.h) { UI.horizon = +ds.h; render(); return; }
-  if (ds.fid) { const f = DB.fixes.find(x => x.id === ds.fid); if (f) fixedSheet(f, 'fix'); return; }
-  if (ds.vid) { const v = DB.virements.find(x => x.id === ds.vid); if (v) fixedSheet(v, 'vir'); return; }
-  if (ds.oid) { const o = DB.operations.find(x => x.id === ds.oid); if (o) opSheet(o); return; }
-  if (ds.newfixed) { sheetRoot.dataset.sens = '-'; fixedSheet(null, 'fix'); return; }
-  if (ds.fkind) { if (ds.fkind === 'vir') fixedSheet(null, 'vir'); else { sheetRoot.dataset.sens = ds.fkind; fixedSheet(null, 'fix'); } return; }
-  if (ds.sens) { draft.sens = ds.sens; const a = $('amt') && $('amt').value, l = $('lb') && $('lb').value, d = $('dt') && $('dt').value; render(); if (a) $('amt').value = a; if (l) $('lb').value = l; if (d) $('dt').value = d; return; }
-  if (ds.cat) { draft.cat = ds.cat; t.parentNode.querySelectorAll('[data-cat]').forEach(b => b.setAttribute('aria-pressed', b === t)); return; }
-  if (ds.newcat) { catSheet(ds.newcat, null); return; }
-  if (ds.editcat) { const c = DB.categories.find(x => x.id === ds.editcat); if (c) catSheet(c.compte, c); return; }
-  if (ds.simtog) { const s = DB.simulations.find(x => x.id === ds.simtog); if (s) commit([upd('Simulations', { id: s.id, actif: t.checked ? 'oui' : 'non' })]); return; }
-  if (ds.simdel) { commit([del('Simulations', ds.simdel)]); toast('Simulation retirée'); return; }
-  if (ds.recon) {
-    const v = num($('rc-' + ds.recon).value); if (v === null || v < 0) { toast('Montant invalide'); return; }
-    const id = CUR + '|' + ds.recon;
-    commit([upd('Pointages', { id, compte: UI.acc, mois: CUR, cle: ds.recon, montantReel: r2(v) })]); toast('Pointé : la prévision passe en réel'); return;
-  }
-  if (ds.unpoint) { commit([del('Pointages', ds.unpoint)]); closeSheet(); toast('Pointage annulé'); return; }
-  if (ds.fixbal) { balSheet(); return; }
-  if (ds.closeMonth) { closeMonthSheet(ds.closeMonth); return; }
-  if (ds.taxmode) { commit([upd('Parametres', { cle: 'impMode', valeur: ds.taxmode })]); return; }
-  if (ds.syncnow) { QUEUE.length ? flush() : pull(); toast('Synchronisation lancée'); return; }
-  if (ds.iosok) { JOIN.iosOk = true; join(); return; }
-  if (ds.joinretry) { JOIN.err = ''; join(); return; }
-  if (ds.onbmode) { ONB.mode = ds.onbmode; render(); return; }
-  if (ds.onbstep) {
-    const P = $('onbP'); if (P) ONB.partner = P.value.trim();
-    if (ds.onbstep === '2' && (!ONB.mode || (ONB.mode === 'duo' && !ONB.partner))) { toast(ONB.mode ? 'Indique le prénom de ton/ta partenaire' : 'Choisis seul ou à deux'); return; }
-    ONB.step = +ds.onbstep; render(); return;
-  }
-  if (ds.onbdone) { finishOnboard(); return; }
-  if (ds.impstep) {
-    if (ds.impstep === 'go') { commitImport(); return; }
-    IMP.step = ds.impstep; render(); scrollTo(0, 0); return;
-  }
-  if (ds.impclose) { UI.imp = null; IMP = null; UI.tab = 'home'; if (BK.queue.length) { const q = BK.queue.shift(); UI.acc = q.acc; startImport(q.parsed, q.mode, { acc: q.acc }); return; } render(); scrollTo(0, 0); return; }
-  if (ds.bklink) { BK.view = 'bank'; BK.acc = ds.bklink; BK.q = ''; BK.list = BK.list || null; render(); scrollTo(0, 0); if (!BK.list) api({ action: 'banques' }).then(j => { BK.list = j.banques; render(); }).catch(e => { toast('Banque : ' + e.message); BK.view = null; render(); }); return; }
-  if (ds.bkbank) { bankStart(BK.acc, ds.bkbank); return; }
-  if (ds.bkrenew) { const r = bkRow(ds.bkrenew); if (r) bankStart(ds.bkrenew, r.aspsp); return; }
-  if (ds.bkunlink) { $('main').querySelector(`[data-bkunlink="${ds.bkunlink}"]`).outerHTML = `<button class="btn danger small" data-bkunlinkok="${esc(ds.bkunlink)}">Confirmer</button>`; return; }
-  if (ds.bkunlinkok) { bankUnlink(ds.bkunlinkok); return; }
-  if (ds.bksync) { bankSync({ force: true }); return; }
-  if (ds.bkok) { BK.res = null; render(); return; }
-  if (ds.bkvoir) { BK.res = null; P.f = 'nc'; P.k = CUR; P.q = ''; UI.tab = 'ponct'; render(); scrollTo(0, 0); return; }
-  if (ds.bkclose) { BK.view = null; BK.msg = ''; if (bkPend()) { BK.view = null; bankLinkCancel(); } render(); return; }
-  if (ds.bklier) { bankLink(); return; }
-  if (ds.impmode) {
-    if (ds.impmode === 'reset') { $('main').querySelector('[data-impmode=reset]').outerHTML = `<div class="note bad" style="display:flex;flex-direction:column;gap:10px"><span>Tout effacer sur <b>${esc(accName(IMP.acc))}</b> et repartir de ce relevé ?${isShared(IMP.acc) ? ` C'est aussi effacé pour ${esc(otherNames())}.` : ''}</span><button class="btn danger" data-impmode="resetok">Oui, tout refaire</button></div>`; return; }
-    startImport(IMP.parsed, ds.impmode === 'resetok' ? 'reset' : 'add'); return;
-  }
-  if (ds.rkeep) { IMP.keep[ds.rkeep] = ds.v === '1'; render(); return; }
-  if (ds.bigk) { IMP.kind[ds.bigk] = ds.k; t.parentNode.querySelectorAll('[data-bigk]').forEach(b => b.setAttribute('aria-pressed', b === t)); return; }
-  if (ds.gnewok) { const n = normCat($('newCatIn').value); if (!n) { toast('Donne un nom'); return; } if (!IMP.newCats.includes(n)) IMP.newCats.push(n); IMP.gcat[ds.gnewok] = n; IMP.gtouch[ds.gnewok] = 1; IMP.creating = null; render(); toast(`Catégorie « ${n} » créée`); return; }
-  if (ds.gmore) { IMP.gshow += 30; render(); return; }
-  if (ds.noreimp) { store.set('le31-noreimp|' + ds.noreimp, true); render(); return; }
-  if (ds.dupfix) {
-    const f = DB.fixes.find(x => x.id === ds.dupfix); if (!f) return;
-    const ops = [del('Fixes', f.id)];
-    DB.pointages.filter(p => p.cle === 'f' + f.id).forEach(p => { ops.push(del('Pointages', p.id)); if (!point(p.mois, 'v' + ds.dupvir)) ops.push(upd('Pointages', { id: p.mois + '|v' + ds.dupvir, compte: p.compte, mois: p.mois, cle: 'v' + ds.dupvir, montantReel: p.montantReel })); });
-    commit(ops); toast('Doublon supprimé : compté une seule fois'); return;
-  }
-  if ('bcat' in ds) { bilToggle(UI.acc, ds.bcat); return; }
-  if (ds.bdet) { bilDetail(UI.acc, ds.bdet); return; }
-  if (ds.bn) { BIL.n = +ds.bn; store.set('le31-bil-n', BIL.n); render(); return; }
-  if (ds.bmode) { BIL.mode = ds.bmode; store.set('le31-bil-mode', BIL.mode); render(); return; }
-  if (ds.tofix) { const o = DB.operations.find(x => x.id === ds.tofix); if (o) { closeSheet(); fixFromOp(o); } return; }
-  if (ds.seuil2) { const o = DB.operations.find(x => x.id === ds.seuil2); if (o) seuilSheet(o); return; }
-  if (ds.seuildel) { const i = ds.seuildel.indexOf('|'), acc = ds.seuildel.slice(0, i), key = ds.seuildel.slice(i + 1); commit([upd('Parametres', { cle: 'seuilCat|' + acc + '|' + key, valeur: '' })]); closeSheet(); toast('Ce marchand n\'est plus séparé par le montant'); return; }
-  if (ds.payauto) { commit([upd('Parametres', { cle: 'payeFin|' + ds.payauto, valeur: '' })]); toast('Date de fin recalculée automatiquement'); return; }
-  if (ds.pview) { P.view = ds.pview; store.set('le31-pview', P.view); render(); return; }
-  if (ds.pm) { P.k = addM(P.k || CUR, +ds.pm); render(); return; }
-  if (ds.pf) { P.f = ds.pf; render(); return; }
-  if ('pcat' in ds) { P.f = 'cat'; P.cat = ds.pcat; P.k = CUR; P.q = ''; UI.tab = 'ponct'; render(); scrollTo(0, 0); return; }
-  if (ds.okind) { t.parentNode.querySelectorAll('[data-okind]').forEach(b => b.setAttribute('aria-pressed', b === t)); const h = $('kindHint'); if (h) h.textContent = ds.okind === 'exc' ? 'Compté dans le solde, pas dans les habitudes ni les prévisions.' : ds.okind === 'int' ? 'Épargne, livret, autre compte à toi : ni dépense ni revenu.' : 'Dépense ou rentrée courante : entre dans les habitudes.'; return; }
-  if (ds.rvir) { IMP.virOn[ds.rvir] = t.checked; return; }
-  if (ds.recal) { IMP.recal = t.checked; return; }
-  if (ds.ucat) { IMP.ucat[ds.ucat] = ds.c; render(); return; }
-  if (ds.invite) { invite(ds.invite); return; }
-  if (ds.cut || ds.cutall) {
-    openSheet(`<div class="form"><h2>Couper ${ds.cut ? 'cet appareil' : 'tous les accès'} de ${esc(ds.cutname)} ?</h2>
-      <div class="note warn">${ds.cut ? "Cet appareil ne pourra plus rien voir ni saisir, tout de suite." : 'Tous ses appareils seront déconnectés et ses liens en attente annulés.'} Les données restent intactes. Envoie ensuite un nouveau lien à ${esc(ds.cutname)} pour son nouvel appareil.</div>
-      <div class="actions"><button class="btn ghost" data-closebtn="1">Annuler</button><button class="btn danger" data-cutok="${esc(ds.cut || '')}" data-cutprof="${esc(ds.cutall || '')}">Couper l'accès</button></div></div>`);
-    return;
-  }
-  if ('cutok' in ds) { cutAccess(ds.cutok ? { acces: ds.cutok } : { profil: ds.cutprof }, 'Accès coupé'); return; }
-  if (ds.closebtn) { closeSheet(); return; }
-  if (ds.copyshare) { const tx = $('shareTxt'); copyText(tx.value, tx); return; }
-  if (ds.doshare) {
-    const tx = $('shareTxt').value;
-    if (navigator.share) navigator.share({ text: tx }).then(() => { closeSheet(); toast('Lien partagé'); }).catch(() => {});
-    else copyText(tx, $('shareTxt'));
-    return;
-  }
-  if (ds.del) { $('confirmBox').innerHTML = `<div class="alert bad" style="display:flex;justify-content:space-between;align-items:center;gap:8px">Supprimer définitivement ? L'historique des mois passés sera recalculé sans elle${DB.profils.length > 1 ? ', pour tout le monde' : ''}.<button type="button" class="btn danger small" data-delok="${esc(ds.del)}">Supprimer</button></div>`; return; }
-  if (ds.delok) {
-    const [k, id] = ds.delok.split(':'), cle = (k === 'vir' ? 'v' : 'f') + id;
-    const ops = [del(k === 'vir' ? 'Virements' : 'Fixes', id)].concat(DB.pointages.filter(p => p.cle === cle).map(p => del('Pointages', p.id)));
-    commit(ops); closeSheet(); toast('Opération supprimée'); return;
-  }
-  if (ds.odel) { $('confirmBox').innerHTML = `<div class="alert bad" style="display:flex;justify-content:space-between;align-items:center;gap:8px">Supprimer cette saisie ?<button type="button" class="btn danger small" data-odelok="${esc(ds.odel)}">Supprimer</button></div>`; return; }
-  if (ds.odelok) {
-    const o = DB.operations.find(x => x.id === ds.odelok); if (!o) { closeSheet(); return; }
-    const ops = [del('Operations', o.id)]; if (o.type === 'vir' && o.lien) DB.operations.filter(x => x.lien === o.lien && x.id !== o.id).forEach(x => ops.push(del('Operations', x.id)));
-    commit(ops); closeSheet(); toast(o.type === 'vir' ? 'Virement supprimé des deux comptes' : 'Saisie supprimée'); return;
-  }
-  if (ds.catdel) { $('confirmBox').innerHTML = `<div class="alert bad" style="display:flex;justify-content:space-between;align-items:center;gap:8px">Les saisies existantes gardent leur catégorie.<button type="button" class="btn danger small" data-catdelok="${esc(ds.catdel)}">Supprimer</button></div>`; return; }
-  if (ds.catdelok) { commit([del('Categories', ds.catdelok)]); closeSheet(); toast('Catégorie supprimée'); return; }
-});
-const refocus = id => { const e = $(id); if (e) { e.focus(); const n = e.value.length; try { e.setSelectionRange(n, n); } catch (x) {} } };
-let qT;
-document.addEventListener('input', ev => {
-  if (ev.target.id === 'taxdelta') { TAX_DELTA = +ev.target.value; render(); const e = $('taxdelta'); if (e) e.focus(); }
-  if (ev.target.id === 'bkQ') { BK.q = ev.target.value; clearTimeout(qT); qT = setTimeout(() => { render(); refocus('bkQ'); }, 200); return; }
-  if (ev.target.id === 'dayV') { UI.dayV = +ev.target.value; render(); const e = $('dayV'); if (e) e.focus(); return; }
-  if (ev.target.id === 'pQ') { P.q = ev.target.value; clearTimeout(qT); qT = setTimeout(() => { render(); refocus('pQ'); }, 250); }
-  if (ev.target.id === 'impQ') { IMP.q = ev.target.value; IMP.gshow = 30; clearTimeout(qT); qT = setTimeout(() => { render(); refocus('impQ'); }, 250); }
-});
-document.addEventListener('change', ev => {
-  const el = ev.target, ds = el.dataset;
-  if (ds.themeAuto) { UI.theme = el.checked ? 'auto' : (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'); applyTheme(); render(); return; }
-  if (ds.themeDark) { UI.theme = el.checked ? 'dark' : 'light'; applyTheme(); render(); return; }
-  if (ds.accname) { const v = el.value.trim(); if (v) { commit([upd('Comptes', { id: ds.accname, nom: v })]); toast(isShared(ds.accname) ? 'Compte renommé pour tout le monde' : 'Compte renommé'); } return; }
-  if (el.id === 'impFile' && el.files && el.files[0]) {
-    const box = $('impErr'); if (box) box.innerHTML = '<div class="hint">Lecture du fichier…</div>';
-    readImportFile(el.files[0]).then(p => startImport(p)).catch(e => { const b = $('impErr'); if (b) b.innerHTML = `<div class="note bad">Fichier non reconnu : ${esc(e.message)}. Choisis un export CSV ou OFX de ta banque (pas un PDF).</div>`; });
-    return;
-  }
-  if (ds.rname) { const r = IMP && IMP.recur.find(x => x.id === ds.rname); if (r && el.value.trim()) r.nom = el.value.trim(); return; }
-  if (ds.gname) { const v = el.value.trim(); if (v) { IMP.gname[ds.gname] = v; IMP.gtouch[ds.gname] = 1; } return; }
-  if (ds.gcat) { if (el.value === '__new') { IMP.creating = ds.gcat; render(); refocus('newCatIn'); return; } IMP.gcat[ds.gcat] = el.value; IMP.gtouch[ds.gcat] = 1; el.classList.toggle('todo', !el.value); return; }
-  if (ds.ocat) { const n = $('oCnew'); if (n) { n.hidden = el.value !== '__new'; if (!n.hidden) n.focus(); } return; }
-  if (ds.vto) { draft.to = el.value; render(); return; }
-  if (el.id === 'onbC') { ONB.commun = el.checked; return; }
-  if (ds.bksel) { BK.sel[ds.bksel] = el.value; render(); return; }
-  if (ds.bkmode) { BK.mode[ds.bkmode] = el.value; return; }
-  if (el.id === 'bkAuto') { BK.auto = el.checked; store.set('le31-bk-auto', BK.auto); return; }
-  if (el.id === 'habOn') { UI.hab = el.checked; store.set('le31-hab', UI.hab); render(); return; }
-  if (el.id === 'bExc') { BIL.exc = el.checked; render(); return; }
-  if (ds.open) { const v = num(el.value); if (el.value.trim() === '' || v !== null) { commit([upd('Comptes', { id: ds.open, soldeDepart: v === null ? '' : r2(v), moisDepart: startMonth(ds.open) })]); toast('Solde de départ mis à jour'); } else toast('Montant invalide'); return; }
-  if (ds.seuil) { const v = num(el.value); if (v !== null) { commit([upd('Comptes', { id: ds.seuil, seuil: r2(v) })]); toast('Seuil mis à jour'); } return; }
-  if (ds.mdep) { const v = el.value; if (/^\d{4}-\d{2}$/.test(v) && v <= CUR) { commit([upd('Comptes', { id: ds.mdep, moisDepart: v })]); toast('Mois de départ mis à jour'); } else toast('Choisis un mois passé ou le mois en cours'); return; }
-  if (ds.prof) { const v = el.value.trim(); if (v) { commit([upd('Profils', { id: ds.prof, nom: v })]); toast(DB.profils.length > 1 ? 'Prénom changé pour tout le monde' : 'Prénom changé'); } return; }
-  if (ds.tax) { const v = ds.tax === 'impAutresAb' ? el.value : num(el.value); if (v !== null && v !== '') commit([upd('Parametres', { cle: ds.tax, valeur: v })]); return; }
-  if (ds.payon) { commit([upd('Parametres', { cle: 'payeOn|' + ds.payon, valeur: el.checked ? 'oui' : 'non' })]); render(); return; }
-  if (ds.payfixe) { commit([upd('Parametres', { cle: 'payeFixe|' + ds.payfixe, valeur: el.value })]); render(); return; }
-  if (ds.payend) { const v = el.value; if (/^\d{4}-\d{2}-\d{2}$/.test(v)) { commit([upd('Parametres', { cle: 'payeFin|' + ds.payend, valeur: v })]); toast('Date de fin de la période mise à jour'); } return; }
-});
-document.addEventListener('submit', ev => {
-  ev.preventDefault(); const f = ev.target;
-  if (f.id === 'keyForm') {
-    if (!readLink($('keyIn').value.trim())) { toast("Lien non reconnu : il doit contenir #inv="); return; }
-    if (!apiOk()) { toast("Le lien ne contient pas l'adresse du serveur : refais-le"); return; }
-    JOIN.iosOk = true; JOIN.err = ''; SYNC.error = ''; join(); return;
-  }
-  if (f.id === 'onbName') {
-    const n = $('onbN').value.trim(); if (!n) { toast('Indique ton prénom'); return; }
-    ONB.name = n; ONB.step = 1; render(); return;
-  }
-  if (f.id === 'startForm') {
-    const v = num($('startBal').value); if (v === null) { toast('Indique le solde'); return; }
-    const sofar = calc(UI.acc, CUR, 0).bal; // opérations déjà passées ce mois-ci
-    commit([upd('Comptes', { id: UI.acc, soldeDepart: r2(v - sofar), moisDepart: CUR })]); toast('C\'est parti !'); return;
-  }
-  if (f.id === 'addForm') {
-    const a = num($('amt').value), dt = $('dt').value;
-    if (!a || a <= 0) { toast('Indique un montant'); return; }
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(dt)) { toast('Indique une date'); return; }
-    const who = ME || '', acc = UI.acc;
-    if (draft.sens === 'v') {
-      const oth = draft.to || otherAcc(acc), lien = uid(), lb = $('lb').value.trim() || 'Virement';
-      commit([upd('Operations', { id: uid(), compte: acc, date: dt, montant: r2(-a), categorie: 'Virement', libelle: lb, profil: who, type: 'vir', lien }),
-              upd('Operations', { id: uid(), compte: oth, date: dt, montant: r2(a), categorie: 'Virement', libelle: lb, profil: who, type: 'vir', lien })]);
-      toast(`Virement de ${eur(a)} vers ${accName(oth)} enregistré`);
-      draft.sens = '-';
-    } else {
-      if (!draft.cat) { toast('Crée d\'abord une catégorie'); return; }
-      const lb = $('lb').value.trim() || draft.cat;
-      commit([upd('Operations', { id: uid(), compte: acc, date: dt, montant: r2(draft.sens === '-' ? -a : a), categorie: draft.cat, libelle: lb, profil: who, type: $('addExc') && $('addExc').checked ? 'exc' : 'ponct', lien: '' })]);
-      toast(`${draft.sens === '-' ? 'Dépense' : 'Rentrée'} ${dt.slice(0, 7) > CUR ? 'prévue' : 'ajoutée'} : ${lb} ${eur(a)}`);
-    }
-    UI.tab = dt.slice(0, 7) > CUR ? 'fore' : 'home'; UI.foreTab = 'budget'; render(); scrollTo(0, 0); return;
-  }
-  if (f.id === 'fixForm') {
-    const id = f.dataset.id || uid(), kind = f.dataset.kind, isNew = !f.dataset.id;
-    const libelle = $('fL').value.trim(), montant = num($('fA').value);
-    const jour = Math.min(31, Math.max(1, parseInt($('fD').value, 10) || 1)), actif = $('fOn').checked ? 'oui' : 'non';
-    const debut = $('fB').value, fin = $('fE').value;
-    if (!libelle || !montant || montant <= 0) { toast('Libellé et montant requis'); return; }
-    if (fin && fin < debut) { toast('La dernière échéance est avant le début'); return; }
-    if (kind === 'vir') {
-      const [de, vers] = $('fDir').value.split('>');
-      commit([upd('Virements', { id, de, vers, libelle, montant: r2(montant), jour, profil: $('fW') ? $('fW').value : '', debut, fin, actif })]);
-      toast(isNew ? 'Virement lié créé sur les deux comptes' : 'Virement mis à jour');
-    } else {
-      const sb = f.querySelector('[data-fkind][aria-pressed=true]');
-      const row = { id, compte: isNew ? UI.acc : (DB.fixes.find(x => x.id === id) || {}).compte || UI.acc, libelle, montant: r2(montant), jour, frequence: $('fF').value, moisRef: $('fS').value, categorie: $('fC').value.trim() || 'Autre', debut, fin, actif };
-      if (isNew) row.sens = sb ? sb.dataset.fkind : (sheetRoot.dataset.sens || '-');
-      const fo = f.dataset.fromop && DB.operations.find(x => x.id === f.dataset.fromop), ops = [];
-      if (fo) {
-        row.compte = fo.compte; row.motif = keyOf(fo.libelle); row.sens = (num(fo.montant) || 0) > 0 ? '+' : '-';
-        const pts = {};
-        [fo].concat(simOps(fo)).filter(x => String(x.date).slice(0, 7) >= debut && (!fin || String(x.date).slice(0, 7) <= fin)).forEach(x => {
-          const k = String(x.date).slice(0, 7), pid = k + '|f' + id; ops.push(del('Operations', x.id));
-          pts[pid] = pts[pid] || { id: pid, compte: fo.compte, mois: k, cle: 'f' + id, montantReel: 0 }; pts[pid].montantReel = r2(pts[pid].montantReel + Math.abs(num(x.montant) || 0));
-        });
-        Object.values(pts).forEach(x => ops.push(upd('Pointages', x)));
-        commit([upd('Fixes', row)].concat(ops)); toast(`Charge fixe créée : ${Object.keys(pts).length} mois pointés`);
-      } else { commit([upd('Fixes', row)]); toast('Charges recalculées'); }
-    }
-    closeSheet(); return;
-  }
-  if (f.id === 'catForm') {
-    const acc = f.dataset.acc, id = f.dataset.id, leaf = $('cN').value.trim(), b = num($('cB').value), par = $('cP') ? $('cP').value : '';
-    if (!leaf) { toast('Donne un nom'); return; }
-    if (/›|>|\//.test(leaf)) { toast('Pour une sous-catégorie, choisis « Ranger dans »'); return; }
-    const cur0 = id && DB.categories.find(c => c.id === id), nom = par ? par + SEP + leaf : (cur0 && cur0.nom.includes(SEP) && !$('cP') ? topOf(cur0.nom) + SEP + leaf : leaf);
-    if (catsOf(acc).some(c => c.nom.toLowerCase() === nom.toLowerCase() && c.id !== id)) { toast('Cette catégorie existe déjà'); return; }
-    if (!id) {
-      const ordre = Math.max(0, ...DB.categories.map(c => num(c.ordre) || 0)) + 1;
-      commit([upd('Categories', { id: uid(), compte: acc, nom, budget: b > 0 ? r2(b) : '', ordre })]);
-      if (UI.tab === 'add') draft.cat = nom;
-    } else {
-      const old = DB.categories.find(c => c.id === id), ops = [upd('Categories', { id, nom, budget: b > 0 ? r2(b) : '' })];
-      if (old && old.nom !== nom) { // renommée ou rangée ailleurs : sous-catégories, opérations, charges fixes et règles suivent
-        const mv = n => n === old.nom ? nom : String(n || '').startsWith(old.nom + SEP) ? nom + n.slice(old.nom.length) : null;
-        DB.categories.filter(c => c.compte === acc && c.id !== id && mv(c.nom)).forEach(c => ops.push(upd('Categories', { id: c.id, nom: mv(c.nom) })));
-        DB.operations.filter(o => o.compte === acc && mv(o.categorie)).forEach(o => ops.push(upd('Operations', { id: o.id, categorie: mv(o.categorie) })));
-        DB.fixes.filter(x => x.compte === acc && mv(x.categorie)).forEach(x => ops.push(upd('Fixes', { id: x.id, categorie: mv(x.categorie) })));
-        DB.regles.filter(r => (r.compte === acc || !r.compte) && mv(r.categorie)).forEach(r => ops.push(upd('Regles', { id: r.id, categorie: mv(r.categorie) })));
-      }
-      commit(ops);
-    }
-    closeSheet(); toast('Catégorie enregistrée'); return;
-  }
-  if (f.id === 'opForm') {
-    const o = DB.operations.find(x => x.id === f.dataset.id); if (!o) { closeSheet(); return; }
-    const a = num($('oA').value), dt = $('oD').value; if (!a || a <= 0) { toast('Indique un montant'); return; }
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(dt)) { toast('Indique une date'); return; }
-    const neg = (num(o.montant) || 0) < 0, lb = $('oL').value.trim(), imp = !!o.ref, ops = [];
-    let cat = $('oC') ? $('oC').value : o.categorie;
-    if (cat === '__new') { cat = normCat($('oCnew').value); if (!cat) { toast('Donne un nom à la catégorie'); return; } }
-    if (cat && !['Virement', 'Correction de solde'].includes(cat)) ops.push(...newCatOps(o.compte, cat));
-    const kb = f.querySelector('[data-okind][aria-pressed=true]'), type = kb ? kb.dataset.okind : o.type;
-    const row = { id: o.id, montant: r2(neg ? -a : a), date: dt, categorie: cat, type: o.type === 'vir' || o.type === 'ajust' ? o.type : type };
-    if (!imp) row.libelle = lb;
-    ops.push(upd('Operations', row));
-    if (o.type === 'vir' && o.lien) DB.operations.filter(x => x.lien === o.lien && x.id !== o.id).forEach(x => ops.push(upd('Operations', { id: x.id, montant: r2(neg ? a : -a), date: dt, libelle: lb })));
-    let n = 0;
-    if (imp && o.type !== 'vir' && o.type !== 'ajust') {
-      const sim = $('oSim') && $('oSim').checked, rf = {};
-      if (lb && lb !== nameOf(o)) rf.nom = lb;
-      if (sim || !simOps(o).length) { rf.categorie = cat; simOps(o).filter(x => isPonct(x) || x.type === 'exc' || x.type === 'int').forEach(x => { if ((x.categorie || '') !== cat) { ops.push(upd('Operations', { id: x.id, categorie: cat })); n++; } }); }
-      if (type === 'int' || (o.type === 'int' && type !== 'int')) rf.type = type === 'int' ? 'int' : '';
-      if (Object.keys(rf).length) ops.push(ruleOp(o.compte, sk(keyOf(o.libelle), num(o.montant)), rf));
-    }
-    commit(ops); closeSheet(); toast(n ? `Mis à jour, avec ${n} opération${n > 1 ? 's' : ''} du même marchand` : 'Opération mise à jour'); return;
-  }
-  if (f.id === 'seuilForm') {
-    const acc = f.dataset.acc, key = f.dataset.key, s = num($('seS').value), bas = $('seBas').value.trim(), haut = $('seHaut').value.trim();
-    if (s === null || s <= 0 || !bas || !haut) { toast('Indique un seuil et les deux catégories'); return; }
-    const ops = [...newCatOps(acc, bas), ...newCatOps(acc, haut), upd('Parametres', { cle: 'seuilCat|' + acc + '|' + key, valeur: JSON.stringify({ s: r2(s), bas, haut }) })];
-    DB.operations.filter(o => o.compte === acc && keyOf(o.libelle) === key && isPonct(o)).forEach(o => { const c = Math.abs(num(o.montant) || 0) > s ? haut : bas; if ((o.categorie || '') !== c) ops.push(upd('Operations', { id: o.id, categorie: c })); });
-    commit(ops); closeSheet(); toast('Séparation enregistrée'); return;
-  }
-  if (f.id === 'balForm') {
-    const v = num($('realBal').value); if (v === null) { toast('Indique le solde de la banque'); return; }
-    const delta = r2(v - curMonth(UI.acc).bal);
-    if (Math.abs(delta) >= 0.01) commit([upd('Operations', { id: uid(), compte: UI.acc, date: TODAY_ISO, montant: delta, categorie: 'Correction de solde', libelle: 'Correction de solde', profil: '', type: 'ajust', lien: '' })]);
-    closeSheet(); toast(Math.abs(delta) >= 0.01 ? `Solde recalé (${sgn(delta)})` : 'Le solde était déjà juste'); render(); return;
-  }
-  if (f.id === 'closeForm') {
-    const k = f.dataset.k, acc = UI.acc, comp = calc(acc, k, startOf(acc, k)).end, v = num($('clReal').value);
-    commit([upd('Clotures', { id: acc + '|' + k, compte: acc, mois: k, soldeFin: r2(v === null ? comp : v), dateCloture: TODAY_ISO })]);
-    closeSheet(); toast(`${mLabel(k)} clôturé : solde reporté`); return;
-  }
-  if (f.id === 'simForm') {
-    const a = num($('simA').value); if (!a || a <= 0) { toast('Indique un montant'); return; }
-    commit([upd('Simulations', { id: uid(), compte: UI.acc, libelle: $('simL').value.trim() || 'Achat', montant: r2(a), mois: $('simM').value, actif: 'oui' })]);
-    toast('Simulation ajoutée'); return;
-  }
-  if (f.id === 'profForm') {
-    const n = $('pfnew').value.trim(); if (!n) { toast('Indique un prénom'); return; }
-    const id = 'p' + uid();
-    commit([upd('Profils', { id, nom: n, perso: $('pfperso').checked ? 'oui' : 'non', ordre: Math.max(0, ...DB.profils.map(p => num(p.ordre) || 0)) + 1 })]);
-    setTimeout(() => invite(id), 400); return;
-  }
-});
 
 /* ================= Installation sur l'écran d'accueil ================= */
 let installEvt = null;
@@ -2297,6 +2030,7 @@ function showInstall() {
   });
 }
 window.addEventListener('appinstalled', () => { const b = document.querySelector('.install'); if (b) b.remove(); });
+
 
 /* ================= Démarrage ================= */
 applyTheme();

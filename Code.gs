@@ -1,5 +1,8 @@
 /**
  * LE 31 — serveur (Google Apps Script lié au Google Sheet « Le 31 »)
+ * Version 3.1 : épargne (Livrets, MvtsLivret), réglages privés par compte (Reglages), colonne livret.
+ * Version 3.0 : nouveaux onglets (Mouvements, Recurrents, Cycles, Prevues, Budgets, Apprentissage) : l'appli V3
+ *   fonctionne par cycles de paie. Les onglets des versions 1 et 2 restent dans le Sheet, intacts, mais ne sont plus envoyés.
  * Version 2.0 : connexion bancaire directe (Enable Banking) ; V1.4 : règles d'import par compte.
  *
  * À coller dans : Google Sheet > Extensions > Apps Script (remplacer tout le contenu).
@@ -7,7 +10,7 @@
  * Voir le tuto d'installation (iPad ou PC).
  */
 
-const VERSION_SERVEUR = '2.0';
+const VERSION_SERVEUR = '3.1';
 const VALIDITE_LIEN_JOURS = 14;
 
 // Onglets du Google Sheet et leurs colonnes (créés automatiquement)
@@ -21,15 +24,30 @@ const ONGLETS = {
   Pointages:   ['id', 'compte', 'mois', 'cle', 'montantReel'],
   Clotures:    ['id', 'compte', 'mois', 'soldeFin', 'dateCloture'],
   Simulations: ['id', 'compte', 'libelle', 'montant', 'mois', 'actif'],
+  Previsions:  ['id', 'compte', 'libelle', 'montant', 'categorie', 'frequence', 'intervalle', 'jour', 'dateDebut', 'dateFin', 'actif', 'projection'],
   Regles:      ['id', 'motif', 'categorie', 'compte', 'nom', 'type'],
   Parametres:  ['cle', 'valeur'],
   Acces:       ['id', 'jeton', 'profil', 'appareil', 'cree', 'vu', 'actif'],
   Invitations: ['code', 'profil', 'cree', 'utilise', 'par'],
-  Banque:      ['id', 'compte', 'aspsp', 'fin', 'nom', 'sid', 'jusqua', 'profil', 'derniere', 'solde', 'actif']
+  Banque:      ['id', 'compte', 'aspsp', 'fin', 'nom', 'sid', 'jusqua', 'profil', 'derniere', 'solde', 'actif'],
+  // V3 : cycles de paie
+  Mouvements:  ['id', 'compte', 'date', 'montant', 'libelle', 'nom', 'categorie', 'type', 'lien', 'auto', 'ref', 'profil', 'livret'],
+  Recurrents:  ['id', 'compte', 'libelle', 'montant', 'sens', 'jour', 'categorie', 'debut', 'fin', 'actif', 'motif', 'livret'],
+  Cycles:      ['id', 'compte', 'mois', 'debut', 'montant', 'soldeDepart', 'manuel'],
+  Prevues:     ['id', 'compte', 'date', 'libelle', 'montant', 'categorie', 'etat', 'lien', 'livret'],
+  Budgets:     ['id', 'compte', 'nom', 'budget', 'ordre'],
+  Apprentissage: ['id', 'compte', 'cle', 'type', 'categorie', 'nom', 'montant'],
+  // V3.1 : épargne et réglages privés d'un compte (salaire, augmentations, primes)
+  Livrets:     ['id', 'compte', 'nom', 'type', 'pointZero', 'dateZero', 'objectif', 'ordre', 'actif'],
+  MvtsLivret:  ['id', 'compte', 'livret', 'date', 'montant', 'type', 'libelle'],
+  Reglages:    ['id', 'compte', 'cle', 'valeur']
 };
 const PRIVES = ['Acces', 'Invitations'];          // jamais renvoyés ni modifiables par l'appli
 const LECTURE = ['Banque'];                       // renvoyé (filtré par compte) mais modifié seulement par le serveur
-const PAR_COMPTE = ['Categories', 'Fixes', 'Operations', 'Pointages', 'Clotures', 'Simulations'];
+const PAR_COMPTE = ['Categories', 'Fixes', 'Operations', 'Pointages', 'Clotures', 'Simulations', 'Previsions',
+  'Mouvements', 'Recurrents', 'Cycles', 'Prevues', 'Budgets', 'Apprentissage', 'Livrets', 'MvtsLivret', 'Reglages'];
+// Onglets des versions 1 et 2 : gardés dans le Sheet (retour arrière possible), plus envoyés ni modifiés par l'appli V3
+const ANCIENS = ['Categories', 'Fixes', 'Virements', 'Operations', 'Pointages', 'Clotures', 'Simulations', 'Previsions', 'Regles'];
 
 const DEPART = {
   Parametres: [
@@ -252,7 +270,7 @@ function tout_(moi) {
   // un virement lié est visible des deux côtés, son pointage aussi
   const virVis = lire_('Virements').filter(r => vis.indexOf(r.de) >= 0 || vis.indexOf(r.vers) >= 0).map(r => 'v' + r.id);
   Object.keys(ONGLETS).forEach(nom => {
-    if (PRIVES.indexOf(nom) >= 0) return;
+    if (PRIVES.indexOf(nom) >= 0 || ANCIENS.indexOf(nom) >= 0) return;
     let rows = lire_(nom);
     if (nom === 'Comptes') rows = rows.filter(r => vis.indexOf(r.id) >= 0);
     else if (nom === 'Virements') rows = rows.filter(r => vis.indexOf(r.de) >= 0 || vis.indexOf(r.vers) >= 0);
@@ -279,7 +297,7 @@ function appliquer_(ops, moi) {
   let refus = 0;
   const parOnglet = {};
   ops.forEach(op => {
-    if (!ONGLETS[op.onglet] || PRIVES.indexOf(op.onglet) >= 0 || LECTURE.indexOf(op.onglet) >= 0) { refus++; return; }
+    if (!ONGLETS[op.onglet] || PRIVES.indexOf(op.onglet) >= 0 || LECTURE.indexOf(op.onglet) >= 0 || ANCIENS.indexOf(op.onglet) >= 0) { refus++; return; }
     (parOnglet[op.onglet] = parOnglet[op.onglet] || []).push(op);
   });
   // ordre : Profils et Comptes d'abord (un nouveau compte doit exister avant ses lignes)
